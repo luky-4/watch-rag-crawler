@@ -1,0 +1,55 @@
+# Data e output (NON committare)
+output/
+data/
+*.jsonl
+*.db
+embeddings/
+chunks/
+articles/
+
+# Secrets (MAI committare)
+config/sites.txt
+.env
+*.key
+secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+venv/
+env/
+.venv/
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Playwright
+.playwright/
+
+# Logs
+*.log
+logs/
+
+# Cache
+.cache/
+*.cache/
+huggingface_cache/

@@ -1,0 +1,140 @@
+name: Nightly Crawl Pipeline
+
+on:
+  schedule:
+    # Ogni giorno alle 2 AM UTC
+    - cron: '0 2 * * *'
+  
+  # Permette lancio manuale
+  workflow_dispatch:
+    inputs:
+      max_pages:
+        description: 'Max pages per site (0 = unlimited)'
+        required: false
+        default: '0'
+
+jobs:
+  crawl-chunk-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6 ore max
+    
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: 🐍 Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: 📦 Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          playwright install chromium
+      
+      - name: 🔐 Create sites.txt from secret
+        run: |
+          mkdir -p config
+          echo "${{ secrets.SITES_LIST }}" > config/sites.txt
+          SITE_COUNT=$(grep -v '^#' config/sites.txt | grep -v '^$' | wc -l)
+          echo "✅ Created sites.txt with $SITE_COUNT sites"
+      
+      - name: 🕷️ Run crawler
+        run: |
+          MAX_PAGES=${{ github.event.inputs.max_pages || '0' }}
+          
+          python3 crawlers/rag_site_crawler.py \
+            --input config/sites.txt \
+            --out ./output \
+            --max-pages $MAX_PAGES \
+            --workers 4
+        continue-on-error: true
+      
+      - name: 🔨 Run chunker
+        if: success() || failure()
+        run: |
+          python3 processing/chunker.py \
+            -i ./output/articles \
+            -o ./output/chunks \
+            --chunk-size 300
+        continue-on-error: true
+      
+      - name: 📤 Upload to Supabase
+        if: success() || failure()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python3 processing/upload_supabase.py \
+            -i ./output/chunks \
+            --batch-size 100
+      
+      - name: 📊 Generate summary
+        if: always()
+        run: |
+          echo "## 📊 Crawl Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Articles
+          if [ -d output/articles ]; then
+            ARTICLES=$(find output/articles -name "*.jsonl" 2>/dev/null | wc -l)
+            echo "- **Articles files**: $ARTICLES" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Chunks
+          if [ -d output/chunks ]; then
+            CHUNKS=$(find output/chunks -name "*.jsonl" 2>/dev/null | wc -l)
+            echo "- **Chunk files**: $CHUNKS" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Stats from DB
+          if [ -f output/chunks/chunker.db ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Chunker Stats" >> $GITHUB_STEP_SUMMARY
+            sqlite3 output/chunks/chunker.db \
+              "SELECT 'Total articles: ' || COUNT(*) FROM chunked_articles" \
+              >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Pipeline completed at $(date -u)" >> $GITHUB_STEP_SUMMARY
+      
+      - name: 📁 Upload artifacts (logs)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: crawl-logs-${{ github.run_number }}
+          path: |
+            output/logs/
+            output/**/*.db
+          retention-days: 30
+          if-no-files-found: ignore
+      
+      - name: 📁 Upload sample output (debug)
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: debug-output-${{ github.run_number }}
+          path: |
+            output/articles/*.jsonl
+            output/chunks/*.jsonl
+          retention-days: 7
+          if-no-files-found: ignore
+      
+      - name: 🚨 Notify on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '🚨 Nightly crawl failed',
+              body: `Workflow run failed: ${runUrl}\n\nCheck the logs for details.`,
+              labels: ['automation', 'bug']
+            });
