@@ -22,7 +22,7 @@ jobs:
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
       
-      - name: 🗄️ Download crawler DB (if exists)
+      - name: 🗄️ Download crawler DB
         uses: dawidd6/action-download-artifact@v3
         continue-on-error: true
         with:
@@ -31,13 +31,33 @@ jobs:
           workflow: nightly-crawl.yml
           if_no_artifact_found: warn
       
-      - name: 🗄️ Decompress DB
+      - name: 🗄️ Download chunker DB
+        uses: dawidd6/action-download-artifact@v3
+        continue-on-error: true
+        with:
+          name: chunker-db
+          path: ./
+          workflow: nightly-crawl.yml
+          if_no_artifact_found: warn
+      
+      - name: 🗄️ Setup databases
         run: |
+          mkdir -p output/chunks
+          
+          # Decomprimi crawler DB
           if [ -f crawler.db.gz ]; then
-            gunzip crawler.db.gz
-            echo "✅ DB decompressed: $(ls -lh crawler.db | awk '{print $5}')"
+            gunzip -c crawler.db.gz > output/crawler.db
+            echo "✅ Crawler DB ready: $(ls -lh output/crawler.db | awk '{print $5}')"
           else
-            echo "⚠️ No previous DB found - starting fresh"
+            echo "⚠️ No previous crawler DB - starting fresh"
+          fi
+          
+          # Decomprimi chunker DB
+          if [ -f chunker.db.gz ]; then
+            gunzip -c chunker.db.gz > output/chunks/chunker.db
+            echo "✅ Chunker DB ready: $(ls -lh output/chunks/chunker.db | awk '{print $5}')"
+          else
+            echo "⚠️ No previous chunker DB - starting fresh"
           fi
       
       - name: 🐍 Setup Python 3.11
@@ -90,22 +110,38 @@ jobs:
             -i ./output/chunks \
             --batch-size 100
       
-      - name: 🗄️ Compress and upload updated DB
+      - name: 🗄️ Compress databases
         if: always()
         run: |
-          if [ -f crawler.db ]; then
-            gzip -f crawler.db
-            echo "✅ DB compressed: $(ls -lh crawler.db.gz | awk '{print $5}')"
-          else
-            echo "⚠️ No DB to upload"
+          # Comprimi crawler DB
+          if [ -f output/crawler.db ]; then
+            gzip -f output/crawler.db
+            mv output/crawler.db.gz crawler.db.gz
+            echo "✅ Crawler DB compressed: $(ls -lh crawler.db.gz | awk '{print $5}')"
+          fi
+          
+          # Comprimi chunker DB
+          if [ -f output/chunks/chunker.db ]; then
+            gzip -f output/chunks/chunker.db
+            mv output/chunks/chunker.db.gz chunker.db.gz
+            echo "✅ Chunker DB compressed: $(ls -lh chunker.db.gz | awk '{print $5}')"
           fi
       
-      - name: 🗄️ Upload crawler DB artifact
+      - name: 🗄️ Upload crawler DB
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: crawler-db
           path: crawler.db.gz
+          retention-days: 90
+          if-no-files-found: warn
+      
+      - name: 🗄️ Upload chunker DB
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chunker-db
+          path: chunker.db.gz
           retention-days: 90
           if-no-files-found: warn
       
@@ -117,8 +153,13 @@ jobs:
           
           # DB Stats
           if [ -f crawler.db.gz ]; then
-            DB_SIZE=$(ls -lh crawler.db.gz | awk '{print $5}')
-            echo "- **Crawler DB**: $DB_SIZE (compressed)" >> $GITHUB_STEP_SUMMARY
+            CRAWLER_SIZE=$(ls -lh crawler.db.gz | awk '{print $5}')
+            echo "- **Crawler DB**: $CRAWLER_SIZE (compressed)" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ -f chunker.db.gz ]; then
+            CHUNKER_SIZE=$(ls -lh chunker.db.gz | awk '{print $5}')
+            echo "- **Chunker DB**: $CHUNKER_SIZE (compressed)" >> $GITHUB_STEP_SUMMARY
           fi
           
           # Articles
@@ -133,15 +174,6 @@ jobs:
             echo "- **Chunk files**: $CHUNKS" >> $GITHUB_STEP_SUMMARY
           fi
           
-          # Stats from DB
-          if [ -f output/chunks/chunker.db ]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### Chunker Stats" >> $GITHUB_STEP_SUMMARY
-            sqlite3 output/chunks/chunker.db \
-              "SELECT 'Total articles: ' || COUNT(*) FROM chunked_articles" \
-              >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
-          fi
-          
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "✅ Pipeline completed at $(date -u)" >> $GITHUB_STEP_SUMMARY
       
@@ -150,9 +182,7 @@ jobs:
         if: always()
         with:
           name: crawl-logs-${{ github.run_number }}
-          path: |
-            output/logs/
-            output/**/*.db
+          path: output/logs/
           retention-days: 30
           if-no-files-found: ignore
       
