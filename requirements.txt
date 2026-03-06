@@ -1,14 +1,12 @@
-# Requirements per GitHub Actions
-
-# Web scraping
+# Core dependencies
 playwright==1.40.0
 trafilatura==1.6.2
 beautifulsoup4==4.12.2
 lxml_html_clean==0.1.1
 requests==2.31.0
 
-# Database
-supabase==2.3.0
+# Supabase (upgraded)
+supabase==2.10.0
 
 # Utils
 tqdm==4.66.0
