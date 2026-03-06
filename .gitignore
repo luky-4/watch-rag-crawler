@@ -53,3 +53,4 @@ logs/
 .cache/
 *.cache/
 huggingface_cache/
+config/brand_seeds.json

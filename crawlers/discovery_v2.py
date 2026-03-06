@@ -10,57 +10,29 @@ import random
 from typing import Set, List
 from bs4 import BeautifulSoup
 import requests
+import json
+import os
 
 # ============================================================================
-# BRAND SEED URLs - Hardcoded per garantire crawling brand pages
+# BRAND SEED URLs - Caricati da file esterno (privato)
 # ============================================================================
-BRAND_SEEDS = {
-    'rolex.com': [
-        'https://www.rolex.com/en-us/watches',
-        'https://www.rolex.com/en-us/about-rolex/history',
-        'https://www.rolex.com/en-us/new-watches',
-        'https://www.rolex.com/en-us/sustainability'
-    ],
-    'patek.com': [
-        'https://www.patek.com/en/collection',
-        'https://www.patek.com/en/company/news',
-        'https://www.patek.com/en/company/history'
-    ],
-    'audemarspiguet.com': [
-        'https://www.audemarspiguet.com/com/en/universe/ap-house.html',
-        'https://www.audemarspiguet.com/com/en/watch-collection.html',
-        'https://www.audemarspiguet.com/com/en/news-room.html'
-    ],
-    'breguet.com': [
-        'https://www.breguet.com/en/history',
-        'https://www.breguet.com/en/news'
-    ],
-    'blancpain.com': [
-        'https://www.blancpain.com/en/news',
-        'https://www.blancpain.com/en/our-universe/history'
-    ],
-    'cartier.com': [
-        'https://www.cartier.com/en-us/maison/news.html',
-        'https://www.cartier.com/en-us/maison/history.html'
-    ],
-    'girard-perregaux.com': [
-        'https://www.girard-perregaux.com/int-en/news',
-        'https://www.girard-perregaux.com/int-en/heritage'
-    ],
-    'piaget.com': [
-        'https://www.piaget.com/news',
-        'https://www.piaget.com/piaget-society'
-    ],
-    'omegawatches.com': [
-        'https://www.omegawatches.com/planet-omega/stories',
-        'https://www.omegawatches.com/planet-omega/heritage',
-        'https://www.omegawatches.com/news'
-    ],
-}
+
+def load_brand_seeds():
+    """Carica brand seeds da file JSON (se esiste)"""
+    seeds_file = os.path.join(os.path.dirname(__file__), '..', 'config', 'brand_seeds.json')
+    
+    if os.path.exists(seeds_file):
+        with open(seeds_file, 'r') as f:
+            return json.load(f)
+    
+    # Fallback vuoto se file non esiste
+    return {}
 
 
 def get_brand_seeds(domain: str) -> List[str]:
     """Ritorna seed URLs hardcoded per un brand"""
+    BRAND_SEEDS = load_brand_seeds()
+    
     for brand_key, seeds in BRAND_SEEDS.items():
         if brand_key in domain:
             return seeds
@@ -282,6 +254,13 @@ def discover_urls(base_url: str, site_type: str, max_limit: int = None) -> Set[s
         all_urls.update(stealth_urls)
     
     return all_urls
+
+
+# ============================================================================
+# BACKWARD COMPATIBILITY
+# ============================================================================
+# Alias per rag_site_crawler.py che importa discover_all()
+discover_all = discover_urls
 
 
 if __name__ == '__main__':
