@@ -22,6 +22,24 @@ jobs:
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
       
+      - name: 🗄️ Download crawler DB (if exists)
+        uses: dawidd6/action-download-artifact@v3
+        continue-on-error: true
+        with:
+          name: crawler-db
+          path: ./
+          workflow: nightly-crawl.yml
+          if_no_artifact_found: warn
+      
+      - name: 🗄️ Decompress DB
+        run: |
+          if [ -f crawler.db.gz ]; then
+            gunzip crawler.db.gz
+            echo "✅ DB decompressed: $(ls -lh crawler.db | awk '{print $5}')"
+          else
+            echo "⚠️ No previous DB found - starting fresh"
+          fi
+      
       - name: 🐍 Setup Python 3.11
         uses: actions/setup-python@v5
         with:
@@ -72,11 +90,36 @@ jobs:
             -i ./output/chunks \
             --batch-size 100
       
+      - name: 🗄️ Compress and upload updated DB
+        if: always()
+        run: |
+          if [ -f crawler.db ]; then
+            gzip -f crawler.db
+            echo "✅ DB compressed: $(ls -lh crawler.db.gz | awk '{print $5}')"
+          else
+            echo "⚠️ No DB to upload"
+          fi
+      
+      - name: 🗄️ Upload crawler DB artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: crawler-db
+          path: crawler.db.gz
+          retention-days: 90
+          if-no-files-found: warn
+      
       - name: 📊 Generate summary
         if: always()
         run: |
           echo "## 📊 Crawl Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # DB Stats
+          if [ -f crawler.db.gz ]; then
+            DB_SIZE=$(ls -lh crawler.db.gz | awk '{print $5}')
+            echo "- **Crawler DB**: $DB_SIZE (compressed)" >> $GITHUB_STEP_SUMMARY
+          fi
           
           # Articles
           if [ -d output/articles ]; then

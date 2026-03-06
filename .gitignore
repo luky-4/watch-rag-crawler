@@ -54,3 +54,5 @@ logs/
 *.cache/
 huggingface_cache/
 config/brand_seeds.json
+crawler.db.gz
+crawler.db
