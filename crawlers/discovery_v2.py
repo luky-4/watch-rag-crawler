@@ -257,10 +257,28 @@ def discover_urls(base_url: str, site_type: str, max_limit: int = None) -> Set[s
 
 
 # ============================================================================
-# BACKWARD COMPATIBILITY
+# BACKWARD COMPATIBILITY - Firma rag_site_crawler.py
 # ============================================================================
-# Alias per rag_site_crawler.py che importa discover_all()
-discover_all = discover_urls
+
+def discover_all(base_url: str, mode: str, logger=None, max_urls: int = None) -> Set[str]:
+    """
+    Wrapper per compatibilità con rag_site_crawler.py
+    
+    Args:
+        base_url: URL base del sito
+        mode: 'blog' o 'brand'
+        logger: Logger object (ignorato, usiamo print)
+        max_urls: Limite max URLs (ignorato per ora)
+    
+    Returns:
+        Set di URLs trovati
+    """
+    # Log compatibilità
+    if logger:
+        logger.info(f"[{urlparse(base_url).netloc}] 🔍 Discovery: {base_url} ({mode})")
+    
+    # Chiama la funzione principale
+    return discover_urls(base_url, mode, max_urls)
 
 
 if __name__ == '__main__':
