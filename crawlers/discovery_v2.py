@@ -260,7 +260,7 @@ def discover_urls(base_url: str, site_type: str, max_limit: int = None) -> Set[s
 # BACKWARD COMPATIBILITY - Firma rag_site_crawler.py
 # ============================================================================
 
-def discover_all(base_url: str, mode: str, logger=None, max_urls: int = None) -> Set[str]:
+def discover_all(base_url: str, mode: str, logger=None, max_urls: int = None) -> List[str]:
     """
     Wrapper per compatibilità con rag_site_crawler.py
     
@@ -271,14 +271,17 @@ def discover_all(base_url: str, mode: str, logger=None, max_urls: int = None) ->
         max_urls: Limite max URLs (ignorato per ora)
     
     Returns:
-        Set di URLs trovati
+        LIST di URLs trovati (non set, per compatibilità con slicing)
     """
     # Log compatibilità
     if logger:
         logger.info(f"[{urlparse(base_url).netloc}] 🔍 Discovery: {base_url} ({mode})")
     
     # Chiama la funzione principale
-    return discover_urls(base_url, mode, max_urls)
+    urls_set = discover_urls(base_url, mode, max_urls)
+    
+    # ✅ CONVERTI SET IN LIST per compatibilità con slicing urls[:3]
+    return list(urls_set)
 
 
 if __name__ == '__main__':
