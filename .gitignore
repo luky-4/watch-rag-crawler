@@ -56,3 +56,5 @@ huggingface_cache/
 config/brand_seeds.json
 crawler.db.gz
 crawler.db
+*.db
+*.db.gz
