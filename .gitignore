@@ -58,3 +58,5 @@ crawler.db.gz
 crawler.db
 *.db
 *.db.gz
+*.db
+*.db.gz
