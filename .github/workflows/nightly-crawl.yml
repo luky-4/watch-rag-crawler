@@ -73,7 +73,7 @@ jobs:
           # Camoufox: Firefox anti-detect, bypassa meglio gli antibot di Chromium.
           # Fallback automatico a Playwright se qualcosa va storto.
           pip install camoufox
-          python -m camoufox fetch --browser firefox
+          python -m camoufox fetch
           # Playwright come fallback
           playwright install chromium
       
