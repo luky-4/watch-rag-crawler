@@ -702,7 +702,7 @@ def extract_article_playwright(url: str, logger: logging.Logger) -> Optional[Dic
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
-                headless=False,
+                headless=True,
                 args=['--disable-blink-features=AutomationControlled', '--no-sandbox']
             )
             context = browser.new_context(
