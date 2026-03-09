@@ -85,11 +85,11 @@ jobs:
           echo "✅ Created sites.txt with $SITE_COUNT sites"
       
       - name: 🔐 Create brand_seeds.json from secret
+        env:
+          BRAND_SEEDS: ${{ secrets.BRAND_SEEDS }}
         run: |
           mkdir -p config
-          cat > config/brand_seeds.json << 'ENDJSON'
-          ${{ secrets.BRAND_SEEDS }}
-          ENDJSON
+          echo "$BRAND_SEEDS" > config/brand_seeds.json
           echo "✅ Created brand_seeds.json"
       
       - name: 🕷️ Run crawler
