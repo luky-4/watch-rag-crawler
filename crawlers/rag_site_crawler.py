@@ -39,7 +39,7 @@ warnings.filterwarnings('ignore', message='Connection pool is full')
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 
 import trafilatura
-from trafilatura import feeds, extract, fetch_url
+from trafilatura import feeds, extract, fetch_url, bare_extraction
 from trafilatura.settings import use_config
 from trafilatura.spider import focused_crawler
 
@@ -71,6 +71,21 @@ FETCH_TIMEOUT = 60
 
 config = use_config()
 config.set("DEFAULT", "EXTRACTION_TIMEOUT", "0")
+
+# --- Filtro URL spazzatura (Patch 2) ---
+import re as _re
+_JUNK_URL_PATTERNS = _re.compile(
+    r'(?:feed|rss|atom|sitemap|\.xml|wp-json|wp-admin|wp-login'
+    r'|/tag/|/tags/|/category/|/categories/|/author/|/page/\d+'
+    r'|/search|/cart|/checkout|/account|/login|/register'
+    r'|\.(css|js|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|pdf|zip)$'
+    r'|utm_|#)',
+    _re.IGNORECASE
+)
+_MIN_WORDS = 80  # Articoli con meno parole = 404/landing vuote
+
+def is_junk_url(url: str) -> bool:
+    return bool(_JUNK_URL_PATTERNS.search(url))
 
 
 # -------------- Chunking (uguale) --------------
@@ -642,25 +657,37 @@ def extract_article(url: str, logger: logging.Logger) -> Optional[Dict]:
         downloaded = fetch_url(url)
         if not downloaded:
             return None
-        
-        result = extract(
+
+        result = bare_extraction(
             downloaded,
             include_comments=False,
             include_tables=False,
             no_fallback=False,
             favor_precision=True,
-            config=config
+            config=config,
+            date_extraction_params={"extensive_search": True, "original_date": True}
         )
-        
-        if not result:
+
+        if not result or not result.get('text'):
             return None
-        
+
+        text = result['text']
+        if len(text.split()) < _MIN_WORDS:
+            logger.debug(f"Skipped (too short {len(text.split())} words): {url}")
+            return None
+
+        date_val = result.get('date')
+        logger.debug(f"{'Date found: ' + date_val if date_val else 'No date'} — {url}")
+
         return {
-            'source_url': url,
-            'title': None,
-            'text': result,
-            'date': None,
-            'authors': None
+            'source_url':  url,
+            'title':       result.get('title'),
+            'text':        text,
+            'date':        date_val,
+            'authors':     result.get('author'),
+            'sitename':    result.get('sitename'),
+            'description': result.get('description'),
+            'tags':        result.get('tags'),
         }
     except Exception as e:
         logger.debug(f"Extract error {url}: {e}")
@@ -858,7 +885,14 @@ def process_site(
         
         def worker(url: str):
             nonlocal ok_count, fail_count
-            
+
+            # Scarta URL spazzatura prima ancora di scaricare
+            if is_junk_url(url):
+                with lock:
+                    fail_count += 1
+                    db.mark_url_crawled(url, domain, 'skipped', 'junk_url')
+                return
+
             try:
                 art = extract_article_smart(url, mode, logger)
                 

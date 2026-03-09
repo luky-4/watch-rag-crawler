@@ -45,21 +45,10 @@ class SemanticChunker:
     def process_article(self, article: dict) -> List[Chunk]:
         text = article.get('text') or article.get('content', '')
         article_id = article['id']
-        
-        if not text:
-            return [Chunk(
-                id=hashlib.md5(f"{article_id}_0".encode()).hexdigest()[:16],
-                article_id=article_id,
-                chunk_index=0,
-                total_chunks=1,
-                text='',
-                token_count=0,
-                metadata={
-                    'url': article.get('url'),
-                    'title': article.get('title'),
-                    'domain': article.get('domain'),
-                }
-            )]
+
+        # Articolo senza testo o troppo corto → non generare chunk
+        if not text or len(text.split()) < 50:
+            return []
         
         sentences = self._split_sentences(text)
         chunks_data = []
@@ -97,10 +86,20 @@ class SemanticChunker:
                 text=chunk_text,
                 token_count=self.estimate_tokens(chunk_text),
                 metadata={
-                    'url': article.get('url'),
-                    'title': article.get('title'),
-                    'domain': article.get('domain'),
-                    'brand': article.get('brand'),
+                    # Campi base
+                    'url':         article.get('source_url') or article.get('url'),
+                    'title':       article.get('title'),
+                    'domain':      article.get('source_domain') or article.get('domain'),
+                    'brand':       article.get('brand'),
+                    'site_type':   article.get('site_type'),
+                    # Campi temporali
+                    'date':        article.get('date'),
+                    'crawled_at':  article.get('crawled_at'),
+                    # Autori e tag
+                    'authors':     article.get('authors'),
+                    'tags':        article.get('tags'),
+                    'sitename':    article.get('sitename'),
+                    'description': article.get('description'),
                 }
             )
             chunks.append(chunk)
@@ -197,16 +196,23 @@ def process_articles_file_incremental(
         articles = new_articles
     
     print(f"  📊 {len(articles)} articoli da processare")
-    
+
     total_chunks = 0
-    
+    skipped_quality = 0
+
     # Appendi ai chunks esistenti
     mode = 'a' if output_file.exists() and not force else 'w'
-    
+
     with open(output_file, mode, encoding='utf-8') as f_out:
         for article in articles:
             chunks = chunker.process_article(article)
-            
+
+            # process_article ritorna [] se testo assente o < 50 parole
+            if not chunks:
+                skipped_quality += 1
+                db.mark_chunked(article['id'], str(input_file), str(output_file), 0)
+                continue
+
             for chunk in chunks:
                 chunk_doc = {
                     'id': chunk.id,
@@ -217,10 +223,10 @@ def process_articles_file_incremental(
                     'token_count': chunk.token_count,
                     'metadata': chunk.metadata
                 }
-                
+
                 f_out.write(json.dumps(chunk_doc, ensure_ascii=False) + '\n')
                 total_chunks += 1
-            
+
             # Segna come processato
             db.mark_chunked(
                 article['id'],
@@ -228,8 +234,10 @@ def process_articles_file_incremental(
                 str(output_file),
                 len(chunks)
             )
-    
-    print(f"  ✅ {len(articles)} articoli → {total_chunks} chunks\n")
+
+    if skipped_quality:
+        print(f"  🗑️  {skipped_quality} articoli scartati (testo assente o < 50 parole)")
+    print(f"  ✅ {len(articles) - skipped_quality} articoli → {total_chunks} chunks\n")
     return len(articles), total_chunks
 
 

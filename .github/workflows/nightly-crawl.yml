@@ -70,6 +70,11 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
+          # Camoufox: Firefox anti-detect, bypassa meglio gli antibot di Chromium.
+          # Fallback automatico a Playwright se qualcosa va storto.
+          pip install camoufox
+          python -m camoufox fetch --browser firefox
+          # Playwright come fallback
           playwright install chromium
       
       - name: 🔐 Create sites.txt from secret
@@ -78,6 +83,12 @@ jobs:
           echo "${{ secrets.SITES_LIST }}" > config/sites.txt
           SITE_COUNT=$(grep -v '^#' config/sites.txt | grep -v '^$' | wc -l)
           echo "✅ Created sites.txt with $SITE_COUNT sites"
+      
+      - name: 🔐 Create brand_seeds.json from secret
+        run: |
+          mkdir -p config
+          echo "${{ secrets.BRAND_SEEDS }}" > config/brand_seeds.json
+          echo "✅ Created brand_seeds.json"
       
       - name: 🕷️ Run crawler
         run: |
