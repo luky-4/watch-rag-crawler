@@ -230,14 +230,24 @@ def _extract_links_from_html(html: str, base_url: str, base_domain: str) -> Set[
 
 
 def _browser_bfs(base_url: str, max_depth: int = 7, max_per_level: int = 100,
-                  timeout_per_page: int = 20000) -> Set[str]:
-    """BFS leggero con Camoufox — usato solo come ultimo fallback."""
+                  timeout_per_page: int = 20000,
+                  partial_sink: list = None, base_found: set = None) -> Set[str]:
+    """BFS leggero con Camoufox — usato solo come ultimo fallback.
+    partial_sink: se fornito, viene aggiornato dopo ogni depth level (per recovery da timeout esterno).
+    base_found: URLs già trovati dagli step precedenti, inclusi nel flush.
+    """
     base_domain = urlparse(base_url).netloc
     all_found: Set[str] = set()
     to_visit = {base_url.rstrip('/')}
     visited: Set[str] = set()
     start = time.time()
     MAX_TOTAL = 300  # secondi massimi totali
+
+    def _flush_bfs():
+        if partial_sink is not None:
+            combined = set(base_found or set()) | all_found
+            partial_sink.clear()
+            partial_sink.extend(list(combined))
 
     def _run_with_browser(browser):
         nonlocal to_visit, visited
@@ -272,6 +282,7 @@ def _browser_bfs(base_url: str, max_depth: int = 7, max_per_level: int = 100,
                             pass
             to_visit = next_level
             print(f"[browser_bfs] Depth {depth+1}/{max_depth}: {len(all_found)} URLs")
+            _flush_bfs()  # flush dopo ogni depth — recovery da timeout esterno
             if not to_visit:
                 break
 
@@ -353,7 +364,8 @@ def discover_urls(base_url: str, site_type: str, max_limit: int = None,
     # LIVELLO 3: Camoufox BFS solo se ancora pochissimi URL
     if len(all_urls) < 20:
         print(f"[{domain}] ⚠️  Solo {len(all_urls)} URLs → Fallback browser BFS")
-        bfs_urls = _browser_bfs(base_url, max_depth=7, max_per_level=100)
+        bfs_urls = _browser_bfs(base_url, max_depth=7, max_per_level=100,
+                                partial_sink=partial_sink, base_found=all_urls)
         all_urls.update(bfs_urls)
         print(f"[{domain}] Dopo BFS: {len(all_urls)} URLs")
         _flush()
