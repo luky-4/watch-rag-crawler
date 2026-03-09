@@ -128,8 +128,8 @@ def try_sitemap(base_url: str) -> Set[str]:
     ]
 
     # Deduplicazione mantenendo l'ordine
-    seen = set()
-    sitemap_candidates = [x for x in sitemap_candidates if not (x in seen or seen.add(x))]
+    seen: Set[str] = set()
+    sitemap_candidates = [x for x in sitemap_candidates if not (x in seen or seen.add(x))]  # type: ignore
 
     for sitemap_url in sitemap_candidates:
         print(f"[{domain}] Sitemap: Provando {sitemap_url}")
@@ -202,7 +202,7 @@ def _crawl4ai_discover(base_url: str, site_type: str, timeout: int = 120) -> Set
 
 
 # ============================================================================
-# LIVELLO 3: CAMOUFOX BFS (solo fallback, max 60s, max_per_level ridotto)
+# LIVELLO 3: CAMOUFOX BFS (solo fallback, max 300s, depth=7, max_per_level=100)
 # ============================================================================
 
 try:
@@ -352,10 +352,15 @@ def discover_urls(base_url: str, site_type: str, max_limit: int = None) -> Set[s
 # ============================================================================
 
 def discover_all(base_url: str, mode: str, logger=None, max_urls: int = None) -> List[str]:
+    domain = urlparse(base_url).netloc
     if logger:
-        logger.info(f"[{urlparse(base_url).netloc}] 🔍 Discovery: {base_url} ({mode})")
-    urls_set = discover_urls(base_url, mode, max_urls)
-    return list(urls_set)
+        logger.info(f"[{domain}] 🔍 Discovery: {base_url} ({mode})")
+    try:
+        urls_set = discover_urls(base_url, mode, max_urls)
+        return list(urls_set)
+    except Exception as e:
+        print(f"[{domain}] ⚠️ discover_all exception: {e}")
+        return []
 
 
 if __name__ == '__main__':

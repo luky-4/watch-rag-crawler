@@ -702,7 +702,7 @@ def extract_article_playwright(url: str, logger: logging.Logger) -> Optional[Dic
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
-                headless=True,
+                headless=False,
                 args=['--disable-blink-features=AutomationControlled', '--no-sandbox']
             )
             context = browser.new_context(
@@ -843,20 +843,59 @@ def process_site(
         
         # Discovery con timeout globale (5 min per depth 5)
         print(f"🔍 Discovery...", end='', flush=True)
-        discovery_max = 1000000
+        discovery_max = 10000
+        _partial: list = []
+
+        def _discover_with_partial():
+            result = discover_urls_robust(site_url, logger, mode, discovery_max)
+            _partial.extend(result)
+            return result
+
         with ThreadPoolExecutor(max_workers=1) as ex:
-            fut = ex.submit(discover_urls_robust, site_url, logger, mode, discovery_max)
+            fut = ex.submit(_discover_with_partial)
             try:
-                urls = fut.result(timeout=300)  # 5 minuti per discovery completa (depth 5)
+                urls = fut.result(timeout=300)  # 5 minuti per discovery completa
             except FutureTimeoutError:
                 logger.warning("Discovery timeout (300s)!")
-                urls = []
+                urls = list(_partial)  # usa risultati parziali già accumulati
+                if urls:
+                    logger.info(f"Discovery parziale: {len(urls)} URLs salvati prima del timeout")
             except Exception as e:
                 logger.error(f"Discovery error: {e}")
-                urls = []
+                urls = list(_partial) if _partial else []
         
         # Fix: confronta URL normalizzati (rimuovi trailing slash e frammenti)
         crawled_urls_normalized = {url.rstrip('/').split('#')[0] for url in crawled_urls}
+
+        # Per siti brand: filtra URL non-inglesi e categorie non rilevanti
+        if mode == 'brand':
+            _LANG_PREFIXES = (
+                '/fr/', '/de/', '/it/', '/es/', '/ja/', '/zh/', '/ko/', '/ru/',
+                '/pt/', '/nl/', '/pl/', '/tr/', '/ar/', '/cs/', '/hu/', '/ro/',
+                '/da/', '/sv/', '/fi/', '/nb/', '/he/', '/th/', '/vi/',
+            )
+            _JUNK_SEGMENTS = (
+                '/boutiques/', '/points-of-sale/', '/points-de-vente/',
+                '/dealers/', '/stores/', '/retailers/', '/stockists/',
+                '/bags-and-accessories/', '/sunglasses/', '/jewellery/',
+                '/jewelry/', '/perfumes/', '/fragrances/', '/lighters/',
+                '/my-', '/myomega/', '/my-favourites/', '/wishlist/',
+                '/cart/', '/checkout/', '/account/', '/login/',
+                '/service/enquiry', '/enquiry',
+                'fbclid=',
+            )
+            filtered = []
+            for u in urls:
+                parsed_path = '/' + '/'.join(u.split('?')[0].split('/')[3:])
+                if any(parsed_path.startswith(lp) for lp in _LANG_PREFIXES):
+                    continue
+                if any(seg in u for seg in _JUNK_SEGMENTS):
+                    continue
+                filtered.append(u)
+            before = len(urls)
+            urls = filtered
+            logger.info(f"Brand URL filter: {before} -> {len(urls)} (rimossi {before - len(urls)} non-EN/junk)")
+
         new_urls = []
         for u in urls:
             u_normalized = u.rstrip('/').split('#')[0]
