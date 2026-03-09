@@ -87,7 +87,9 @@ jobs:
       - name: 🔐 Create brand_seeds.json from secret
         run: |
           mkdir -p config
-          echo "${{ secrets.BRAND_SEEDS }}" > config/brand_seeds.json
+          cat > config/brand_seeds.json << 'ENDJSON'
+          ${{ secrets.BRAND_SEEDS }}
+          ENDJSON
           echo "✅ Created brand_seeds.json"
       
       - name: 🕷️ Run crawler

@@ -843,7 +843,7 @@ def process_site(
         
         # Discovery con timeout globale (5 min per depth 5)
         print(f"🔍 Discovery...", end='', flush=True)
-        discovery_max = 10000
+        discovery_max = 1000000
         with ThreadPoolExecutor(max_workers=1) as ex:
             fut = ex.submit(discover_urls_robust, site_url, logger, mode, discovery_max)
             try:
