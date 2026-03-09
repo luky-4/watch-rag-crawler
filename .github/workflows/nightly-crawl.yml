@@ -22,24 +22,24 @@ jobs:
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
       
-      - name: 🗄️ Download crawler DB
-        uses: dawidd6/action-download-artifact@v3
+      - name: 🗄️ Download databases from Supabase Storage
         continue-on-error: true
-        with:
-          name: crawler-db
-          path: ./
-          workflow: nightly-crawl.yml
-          if_no_artifact_found: warn
-      
-      - name: 🗄️ Download chunker DB
-        uses: dawidd6/action-download-artifact@v3
-        continue-on-error: true
-        with:
-          name: chunker-db
-          path: ./
-          workflow: nightly-crawl.yml
-          if_no_artifact_found: warn
-      
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          # Download crawler DB
+          HTTP=$(curl -s -o crawler.db.gz -w "%{http_code}" \
+            "$SUPABASE_URL/storage/v1/object/crawler-dbs/crawler.db.gz" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY")
+          [ "$HTTP" = "200" ] && echo "✅ crawler.db.gz scaricato" || echo "⚠️ crawler.db.gz non trovato (fresh start)"
+
+          # Download chunker DB
+          HTTP=$(curl -s -o chunker.db.gz -w "%{http_code}" \
+            "$SUPABASE_URL/storage/v1/object/crawler-dbs/chunker.db.gz" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY")
+          [ "$HTTP" = "200" ] && echo "✅ chunker.db.gz scaricato" || echo "⚠️ chunker.db.gz non trovato (fresh start)"
+
       - name: 🗄️ Setup databases
         run: |
           mkdir -p output/chunks
@@ -121,14 +121,24 @@ jobs:
             -i ./output/chunks \
             --batch-size 100
       
-      - name: 🗄️ Compress databases
+      - name: 🗄️ Compress and upload databases to Supabase Storage
         if: always()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: |
           # Comprimi crawler DB
           if [ -f output/crawler.db ]; then
             gzip -f output/crawler.db
             mv output/crawler.db.gz crawler.db.gz
             echo "✅ Crawler DB compressed: $(ls -lh crawler.db.gz | awk '{print $5}')"
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+              "$SUPABASE_URL/storage/v1/object/crawler-dbs/crawler.db.gz" \
+              -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+              -H "Content-Type: application/octet-stream" \
+              -H "x-upsert: true" \
+              --data-binary @crawler.db.gz)
+            [ "$HTTP" = "200" ] && echo "✅ crawler.db.gz uploadato su Supabase" || echo "❌ Upload crawler fallito (HTTP $HTTP)"
           fi
           
           # Comprimi chunker DB
@@ -136,26 +146,15 @@ jobs:
             gzip -f output/chunks/chunker.db
             mv output/chunks/chunker.db.gz chunker.db.gz
             echo "✅ Chunker DB compressed: $(ls -lh chunker.db.gz | awk '{print $5}')"
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+              "$SUPABASE_URL/storage/v1/object/crawler-dbs/chunker.db.gz" \
+              -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+              -H "Content-Type: application/octet-stream" \
+              -H "x-upsert: true" \
+              --data-binary @chunker.db.gz)
+            [ "$HTTP" = "200" ] && echo "✅ chunker.db.gz uploadato su Supabase" || echo "❌ Upload chunker fallito (HTTP $HTTP)"
           fi
-      
-      - name: 🗄️ Upload crawler DB
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: crawler-db
-          path: crawler.db.gz
-          retention-days: 90
-          if-no-files-found: warn
-      
-      - name: 🗄️ Upload chunker DB
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: chunker-db
-          path: chunker.db.gz
-          retention-days: 90
-          if-no-files-found: warn
-      
+
       - name: 📊 Generate summary
         if: always()
         run: |
@@ -165,12 +164,11 @@ jobs:
           # DB Stats
           if [ -f crawler.db.gz ]; then
             CRAWLER_SIZE=$(ls -lh crawler.db.gz | awk '{print $5}')
-            echo "- **Crawler DB**: $CRAWLER_SIZE (compressed)" >> $GITHUB_STEP_SUMMARY
+            echo "- **Crawler DB**: $CRAWLER_SIZE → Supabase Storage" >> $GITHUB_STEP_SUMMARY
           fi
-          
           if [ -f chunker.db.gz ]; then
             CHUNKER_SIZE=$(ls -lh chunker.db.gz | awk '{print $5}')
-            echo "- **Chunker DB**: $CHUNKER_SIZE (compressed)" >> $GITHUB_STEP_SUMMARY
+            echo "- **Chunker DB**: $CHUNKER_SIZE → Supabase Storage" >> $GITHUB_STEP_SUMMARY
           fi
           
           # Articles
