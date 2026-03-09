@@ -284,35 +284,48 @@ def discover_urls(base_url: str, site_type: str, max_limit: int = None) -> Set[s
     domain = urlparse(base_url).netloc
     all_urls: Set[str] = set()
 
-    # LIVELLO 1: Sitemap
-    sitemap_urls = try_sitemap(base_url)
-    if sitemap_urls:
-        all_urls.update(sitemap_urls)
-        print(f"[{domain}] ✅ Sitemap: {len(all_urls)} URLs")
+    # LIVELLO 1: Sitemap — sempre, indipendente da tutto il resto
+    try:
+        sitemap_urls = try_sitemap(base_url)
+        if sitemap_urls:
+            all_urls.update(sitemap_urls)
+            print(f"[{domain}] ✅ Sitemap: {len(all_urls)} URLs")
+    except Exception as e:
+        print(f"[{domain}] ⚠️ Sitemap error (ignorato): {e}")
 
     # Brand seeds — aggiunti sempre per siti brand
     if site_type == 'brand':
-        seeds = get_brand_seeds(domain)
-        if seeds:
-            print(f"[{domain}] 🌱 {len(seeds)} seed URLs")
-            all_urls.update(seeds)
+        try:
+            seeds = get_brand_seeds(domain)
+            if seeds:
+                print(f"[{domain}] 🌱 {len(seeds)} seed URLs")
+                all_urls.update(seeds)
+        except Exception as e:
+            print(f"[{domain}] ⚠️ Brand seeds error (ignorato): {e}")
 
-    # LIVELLO 2: Crawl4AI AsyncUrlSeeder se sitemap ha trovato poco
+    # LIVELLO 2: Crawl4AI AsyncUrlSeeder solo se sitemap ha trovato poco
+    # Isolato in try/except: un crash di crawl4ai non deve mai azzerare i risultati sitemap
     if len(all_urls) < 50:
         if CRAWL4AI_AVAILABLE:
             print(f"[{domain}] ⚠️  Solo {len(all_urls)} URLs → Crawl4AI AsyncUrlSeeder")
-            c4a_urls = _crawl4ai_discover(base_url, site_type, timeout=120)
-            all_urls.update(c4a_urls)
-            print(f"[{domain}] Dopo Crawl4AI: {len(all_urls)} URLs")
+            try:
+                c4a_urls = _crawl4ai_discover(base_url, site_type, timeout=120)
+                all_urls.update(c4a_urls)
+                print(f"[{domain}] Dopo Crawl4AI: {len(all_urls)} URLs")
+            except Exception as e:
+                print(f"[{domain}] ⚠️ Crawl4AI error (ignorato, sitemap già acquisita): {e}")
         else:
             print(f"[{domain}] ⚠️  Crawl4AI non disponibile")
 
     # LIVELLO 3: Camoufox BFS solo se ancora pochissimi URL
     if len(all_urls) < 20:
         print(f"[{domain}] ⚠️  Solo {len(all_urls)} URLs → Fallback browser BFS")
-        bfs_urls = _browser_bfs(base_url, max_depth=2, max_per_level=15)
-        all_urls.update(bfs_urls)
-        print(f"[{domain}] Dopo BFS: {len(all_urls)} URLs")
+        try:
+            bfs_urls = _browser_bfs(base_url, max_depth=2, max_per_level=15)
+            all_urls.update(bfs_urls)
+            print(f"[{domain}] Dopo BFS: {len(all_urls)} URLs")
+        except Exception as e:
+            print(f"[{domain}] ⚠️ BFS error (ignorato): {e}")
 
     if max_limit and len(all_urls) > max_limit:
         all_urls = set(list(all_urls)[:max_limit])
@@ -327,8 +340,15 @@ def discover_urls(base_url: str, site_type: str, max_limit: int = None) -> Set[s
 def discover_all(base_url: str, mode: str, logger=None, max_urls: int = None) -> List[str]:
     if logger:
         logger.info(f"[{urlparse(base_url).netloc}] 🔍 Discovery: {base_url} ({mode})")
-    urls_set = discover_urls(base_url, mode, max_urls)
-    return list(urls_set)
+    try:
+        urls_set = discover_urls(base_url, mode, max_urls)
+        return list(urls_set)
+    except Exception as e:
+        if logger:
+            logger.error(f"Discovery fatal error (returning empty): {e}")
+        else:
+            print(f"[discovery_v2] Fatal error (returning empty): {e}")
+        return []
 
 
 if __name__ == '__main__':
