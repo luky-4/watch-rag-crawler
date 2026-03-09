@@ -222,6 +222,37 @@ def stealth_discover(base_url: str, site_type: str, max_depth: int = 3) -> Set[s
 # SITEMAP DISCOVERY
 # ============================================================================
 
+def _fetch_sitemap_urls(sitemap_url: str, base_domain: str, depth: int = 0) -> Set[str]:
+    """Scarica un sitemap, segue sub-sitemap se è un index, ritorna URL pagine."""
+    found = set()
+    if depth > 2:
+        return found
+    try:
+        resp = requests.get(sitemap_url, timeout=10, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+        if resp.status_code != 200:
+            return found
+        soup = BeautifulSoup(resp.text, 'xml')
+        # Sitemap index: contiene tag <sitemap><loc>
+        sub_sitemaps = soup.find_all('sitemap')
+        if sub_sitemaps:
+            for s in sub_sitemaps:
+                loc = s.find('loc')
+                if loc:
+                    sub_url = loc.text.strip()
+                    found.update(_fetch_sitemap_urls(sub_url, base_domain, depth + 1))
+        else:
+            # Sitemap normale: contiene tag <url><loc>
+            for loc in soup.find_all('loc'):
+                url = loc.text.strip()
+                if url.startswith('http') and _is_valid_url(url, base_domain):
+                    found.add(url)
+    except Exception:
+        pass
+    return found
+
+
 def try_sitemap(base_url: str) -> Set[str]:
     found = set()
     domain = urlparse(base_url).netloc
@@ -235,25 +266,12 @@ def try_sitemap(base_url: str) -> Set[str]:
     ]
 
     for sitemap_url in sitemap_urls:
-        try:
-            print(f"[{domain}] Sitemap: Provando {sitemap_url}")
-            resp = requests.get(sitemap_url, timeout=10, headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            })
-
-            if resp.status_code == 200 and 'xml' in resp.headers.get('content-type', ''):
-                soup = BeautifulSoup(resp.text, 'xml')
-                for loc in soup.find_all('loc'):
-                    url = loc.text.strip()
-                    if url.startswith('http') and _is_valid_url(url, base_domain):
-                        found.add(url)
-
-                if found:
-                    print(f"[{domain}] Sitemap: {sitemap_url} → {len(found)} URLs")
-                    break
-
-        except Exception:
-            pass
+        print(f"[{domain}] Sitemap: Provando {sitemap_url}")
+        urls = _fetch_sitemap_urls(sitemap_url, base_domain)
+        if urls:
+            found.update(urls)
+            print(f"[{domain}] Sitemap: {sitemap_url} → {len(urls)} URLs")
+            break
 
     return found
 
