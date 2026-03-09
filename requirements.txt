@@ -1,5 +1,5 @@
 # Core dependencies
-playwright==1.40.0
+playwright>=1.49.0
 trafilatura==1.6.2
 beautifulsoup4==4.12.2
 lxml_html_clean==0.1.1
