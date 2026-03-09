@@ -96,16 +96,18 @@ def _fetch_sitemap_urls(sitemap_url: str, base_domain: str, depth: int = 0) -> S
 
 
 def _get_sitemaps_from_robots(base_url: str) -> List[str]:
-    """Legge robots.txt e restituisce le sitemap dichiarate."""
+    """Legge robots.txt e restituisce le sitemap dichiarate (deduplicate)."""
     domain = urlparse(base_url).netloc
     found = []
+    seen = set()
     try:
         resp = requests.get(f"https://{domain}/robots.txt", timeout=10, headers=_HEADERS)
         if resp.status_code == 200:
             for line in resp.text.splitlines():
                 if line.lower().startswith('sitemap:'):
                     url = line.split(':', 1)[1].strip()
-                    if url.startswith('http'):
+                    if url.startswith('http') and url not in seen:
+                        seen.add(url)
                         found.append(url)
                         print(f"[{domain}] robots.txt → sitemap: {url}")
     except Exception:
@@ -116,7 +118,7 @@ def _get_sitemaps_from_robots(base_url: str) -> List[str]:
 def try_sitemap(base_url: str) -> Set[str]:
     domain = urlparse(base_url).netloc
 
-    # Prima leggi robots.txt per trovare sitemap dichiarate
+    # Prima leggi robots.txt per sitemap dichiarate (deduplicate)
     robots_sitemaps = _get_sitemaps_from_robots(base_url)
 
     sitemap_candidates = robots_sitemaps + [
@@ -126,10 +128,9 @@ def try_sitemap(base_url: str) -> Set[str]:
         f"https://{domain}/sitemap-posts.xml",
         f"https://{domain}/news-sitemap.xml",
     ]
-
-    # Deduplicazione mantenendo l'ordine
-    seen: Set[str] = set()
-    sitemap_candidates = [x for x in sitemap_candidates if not (x in seen or seen.add(x))]  # type: ignore
+    # Deduplicazione mantenendo ordine
+    seen = set()
+    sitemap_candidates = [x for x in sitemap_candidates if not (x in seen or seen.add(x))]
 
     for sitemap_url in sitemap_candidates:
         print(f"[{domain}] Sitemap: Provando {sitemap_url}")
@@ -202,7 +203,7 @@ def _crawl4ai_discover(base_url: str, site_type: str, timeout: int = 120) -> Set
 
 
 # ============================================================================
-# LIVELLO 3: CAMOUFOX BFS (solo fallback, max 300s, depth=7, max_per_level=100)
+# LIVELLO 3: CAMOUFOX BFS (solo fallback, max 60s, max_per_level ridotto)
 # ============================================================================
 
 try:
@@ -236,7 +237,7 @@ def _browser_bfs(base_url: str, max_depth: int = 7, max_per_level: int = 100,
     to_visit = {base_url.rstrip('/')}
     visited: Set[str] = set()
     start = time.time()
-    MAX_TOTAL = 300  # secondi massimi totali (5 minuti)
+    MAX_TOTAL = 300  # secondi massimi totali
 
     def _run_with_browser(browser):
         nonlocal to_visit, visited
@@ -307,15 +308,28 @@ def _browser_bfs(base_url: str, max_depth: int = 7, max_per_level: int = 100,
 # ORCHESTRATOR PRINCIPALE
 # ============================================================================
 
-def discover_urls(base_url: str, site_type: str, max_limit: int = None) -> Set[str]:
+def discover_urls(base_url: str, site_type: str, max_limit: int = None,
+                  partial_sink: list = None) -> Set[str]:
+    """
+    partial_sink: lista opzionale condivisa col chiamante.
+    Viene popolata dopo ogni livello — così anche in caso di timeout
+    il crawler recupera i risultati parziali.
+    """
     domain = urlparse(base_url).netloc
     all_urls: Set[str] = set()
+
+    def _flush():
+        """Copia lo stato corrente in partial_sink."""
+        if partial_sink is not None:
+            partial_sink.clear()
+            partial_sink.extend(list(all_urls))
 
     # LIVELLO 1: Sitemap
     sitemap_urls = try_sitemap(base_url)
     if sitemap_urls:
         all_urls.update(sitemap_urls)
         print(f"[{domain}] ✅ Sitemap: {len(all_urls)} URLs")
+        _flush()
 
     # Brand seeds — aggiunti sempre per siti brand
     if site_type == 'brand':
@@ -323,6 +337,7 @@ def discover_urls(base_url: str, site_type: str, max_limit: int = None) -> Set[s
         if seeds:
             print(f"[{domain}] 🌱 {len(seeds)} seed URLs")
             all_urls.update(seeds)
+            _flush()
 
     # LIVELLO 2: Crawl4AI AsyncUrlSeeder se sitemap ha trovato poco
     if len(all_urls) < 50:
@@ -331,6 +346,7 @@ def discover_urls(base_url: str, site_type: str, max_limit: int = None) -> Set[s
             c4a_urls = _crawl4ai_discover(base_url, site_type, timeout=120)
             all_urls.update(c4a_urls)
             print(f"[{domain}] Dopo Crawl4AI: {len(all_urls)} URLs")
+            _flush()
         else:
             print(f"[{domain}] ⚠️  Crawl4AI non disponibile")
 
@@ -340,6 +356,7 @@ def discover_urls(base_url: str, site_type: str, max_limit: int = None) -> Set[s
         bfs_urls = _browser_bfs(base_url, max_depth=7, max_per_level=100)
         all_urls.update(bfs_urls)
         print(f"[{domain}] Dopo BFS: {len(all_urls)} URLs")
+        _flush()
 
     if max_limit and len(all_urls) > max_limit:
         all_urls = set(list(all_urls)[:max_limit])
@@ -351,16 +368,12 @@ def discover_urls(base_url: str, site_type: str, max_limit: int = None) -> Set[s
 # BACKWARD COMPATIBILITY
 # ============================================================================
 
-def discover_all(base_url: str, mode: str, logger=None, max_urls: int = None) -> List[str]:
-    domain = urlparse(base_url).netloc
+def discover_all(base_url: str, mode: str, logger=None, max_urls: int = None,
+                 partial_sink: list = None) -> List[str]:
     if logger:
-        logger.info(f"[{domain}] 🔍 Discovery: {base_url} ({mode})")
-    try:
-        urls_set = discover_urls(base_url, mode, max_urls)
-        return list(urls_set)
-    except Exception as e:
-        print(f"[{domain}] ⚠️ discover_all exception: {e}")
-        return []
+        logger.info(f"[{urlparse(base_url).netloc}] 🔍 Discovery: {base_url} ({mode})")
+    urls_set = discover_urls(base_url, mode, max_urls, partial_sink=partial_sink)
+    return list(urls_set)
 
 
 if __name__ == '__main__':

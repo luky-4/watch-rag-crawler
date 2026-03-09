@@ -621,14 +621,16 @@ def discover_crawl4ai(base_url: str, logger: logging.Logger) -> Set[str]:
     return urls
 
 
-def discover_urls_robust(base_url: str, logger: logging.Logger, mode: str, max_urls: int = 10000) -> List[str]:
+def discover_urls_robust(base_url: str, logger: logging.Logger, mode: str,
+                         max_urls: int = 10000, partial_sink: list = None) -> List[str]:
     """
     Discovery COMPLETA - USA DISCOVERY_V2 PULITA
+    partial_sink: lista condivisa col chiamante, popolata dopo ogni livello.
     """
     from discovery_v2 import discover_all
     
     try:
-        urls = discover_all(base_url, mode, logger, max_urls)
+        urls = discover_all(base_url, mode, logger, max_urls, partial_sink=partial_sink)
         logger.info(f"🔍 DEBUG CRAWLER: discover_all ritornato {len(urls)} URLs")
         logger.info(f"🔍 DEBUG CRAWLER: Primi 3 URLs: {urls[:3]}")
         return urls
@@ -841,31 +843,25 @@ def process_site(
         crawled_urls = db.get_crawled_urls(domain)
         logger.info(f"Already: {len(crawled_urls)} URLs")
         
-        # Discovery con timeout globale (5 min per depth 5)
+        # Discovery con timeout globale (5 min)
         print(f"🔍 Discovery...", end='', flush=True)
         discovery_max = 10000
         _partial: list = []
 
-        def _discover_with_partial():
-            result = discover_urls_robust(site_url, logger, mode, discovery_max)
-            _partial.extend(result)
-            return result
-
         with ThreadPoolExecutor(max_workers=1) as ex:
-            fut = ex.submit(_discover_with_partial)
+            fut = ex.submit(discover_urls_robust, site_url, logger, mode, discovery_max, _partial)
             try:
-                urls = fut.result(timeout=300)  # 5 minuti per discovery completa
+                urls = fut.result(timeout=300)
             except FutureTimeoutError:
                 logger.warning("Discovery timeout (300s)!")
-                urls = list(_partial)  # usa risultati parziali già accumulati
+                urls = list(_partial)  # risultati parziali dal partial_sink
                 if urls:
                     logger.info(f"Discovery parziale: {len(urls)} URLs salvati prima del timeout")
+                else:
+                    urls = []
             except Exception as e:
                 logger.error(f"Discovery error: {e}")
                 urls = list(_partial) if _partial else []
-        
-        # Fix: confronta URL normalizzati (rimuovi trailing slash e frammenti)
-        crawled_urls_normalized = {url.rstrip('/').split('#')[0] for url in crawled_urls}
 
         # Per siti brand: filtra URL non-inglesi e categorie non rilevanti
         if mode == 'brand':
@@ -896,6 +892,8 @@ def process_site(
             urls = filtered
             logger.info(f"Brand URL filter: {before} -> {len(urls)} (rimossi {before - len(urls)} non-EN/junk)")
 
+        # Fix: confronta URL normalizzati (rimuovi trailing slash e frammenti)
+        crawled_urls_normalized = {url.rstrip('/').split('#')[0] for url in crawled_urls}
         new_urls = []
         for u in urls:
             u_normalized = u.rstrip('/').split('#')[0]

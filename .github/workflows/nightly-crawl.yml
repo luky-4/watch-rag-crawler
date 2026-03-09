@@ -2,8 +2,8 @@ name: Nightly Crawl Pipeline
 
 on:
   schedule:
-    # Ogni giorno alle 2 AM UTC
-    - cron: '0 2 * * *'
+    # Ogni lunedì alle 2 AM UTC
+    - cron: '0 2 * * 1'
   
   # Permette lancio manuale
   workflow_dispatch:
