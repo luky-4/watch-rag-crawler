@@ -188,23 +188,26 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "✅ Pipeline completed at $(date -u)" >> $GITHUB_STEP_SUMMARY
       
-      - name: 📁 Upload artifacts (logs)
-        uses: actions/upload-artifact@v4
+      - name: 📁 Upload logs to Supabase Storage
         if: always()
-        with:
-          name: crawl-logs-${{ github.run_number }}
-          path: output/logs/
-          retention-days: 30
-          if-no-files-found: ignore
-      
-      - name: 📁 Upload sample output (debug)
-        uses: actions/upload-artifact@v4
-        if: failure()
-        with:
-          name: debug-output-${{ github.run_number }}
-          path: |
-            output/articles/*.jsonl
-            output/chunks/*.jsonl
-          retention-days: 7
-          if-no-files-found: ignore
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          RUN_DIR="run-${{ github.run_number }}"
+          if [ -d output/logs ] && [ "$(ls -A output/logs)" ]; then
+            cd output/logs
+            for f in *; do
+              HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+                "$SUPABASE_URL/storage/v1/object/crawler-dbs/logs/$RUN_DIR/$f" \
+                -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+                -H "Content-Type: text/plain" \
+                -H "x-upsert: true" \
+                --data-binary @"$f")
+              [ "$HTTP" = "200" ] && echo "✅ $f" || echo "❌ $f (HTTP $HTTP)"
+            done
+            cd -
+          else
+            echo "⚠️ Nessun log trovato"
+          fi
       
