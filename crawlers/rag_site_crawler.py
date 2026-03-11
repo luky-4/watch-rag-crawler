@@ -640,18 +640,60 @@ def discover_urls_robust(base_url: str, logger: logging.Logger, mode: str,
 
 
 def extract_brand(text: str) -> Optional[str]:
+    """Cerca il brand principale nel testo. Ordine: multi-word prima per evitare match parziali."""
     brands = [
-        'Rolex', 'Omega', 'Seiko', 'Breitling', 'Patek Philippe',
-        'Audemars Piguet', 'Vacheron Constantin', 'IWC', 'Panerai',
-        'Cartier', 'Tudor', 'Grand Seiko', 'Urwerk', 'Doxa',
-        'Hamilton', 'Marathon', 'Heuer', 'TAG Heuer', 'Longines', 'Blancpain'
+        # Multi-word prima (evita che 'Heuer' catturi 'TAG Heuer', ecc.)
+        'Patek Philippe', 'Audemars Piguet', 'Vacheron Constantin',
+        'TAG Heuer', 'Grand Seiko', 'Glashutte Original', 'Glashütte Original',
+        'Girard-Perregaux', 'Girard Perregaux',
+        'A. Lange & Söhne', 'A. Lange',
+        'Jaeger-LeCoultre', 'Jaeger LeCoultre',
+        'F.P. Journe', 'FP Journe',
+        'Richard Mille', 'Ulysse Nardin', 'Franck Muller',
+        'Bell & Ross', 'MB&F',
+        # Single-word
+        'Rolex', 'Omega', 'Breguet', 'Blancpain', 'Cartier',
+        'Panerai', 'Breitling', 'IWC', 'Tudor', 'Longines',
+        'Piaget', 'Parmigiani', 'Hublot', 'Zenith', 'Chopard',
+        'Seiko', 'Hamilton', 'Doxa', 'Urwerk', 'HYT',
     ]
-    
     text_lower = text.lower()
     for brand in brands:
         if brand.lower() in text_lower:
             return brand
     return None
+
+
+# Mappa dominio → brand canonico per siti brand ufficiali
+_DOMAIN_BRAND_MAP = {
+    'rolex.com':               'Rolex',
+    'patek.com':               'Patek Philippe',
+    'audemarspiguet.com':      'Audemars Piguet',
+    'tagheuer.com':            'TAG Heuer',
+    'tudorwatch.com':          'Tudor',
+    'breguet.com':             'Breguet',
+    'blancpain.com':           'Blancpain',
+    'glashuette-original.com': 'Glashutte Original',
+    'cartier.com':             'Cartier',
+    'girard-perregaux.com':    'Girard-Perregaux',
+    'parmigiani.com':          'Parmigiani',
+    'piaget.com':              'Piaget',
+    'omegawatches.com':        'Omega',
+    'iwc.com':                 'IWC',
+    'panerai.com':             'Panerai',
+    'breitling.com':           'Breitling',
+    'longines.com':            'Longines',
+    'vacheron-constantin.com': 'Vacheron Constantin',
+    'jaeger-lecoultre.com':    'Jaeger-LeCoultre',
+    'richardmille.com':        'Richard Mille',
+    'hublot.com':              'Hublot',
+    'zenith-watches.com':      'Zenith',
+    'chopard.com':             'Chopard',
+    'alange-soehne.com':       'A. Lange & Söhne',
+    'ulyssenardin.com':        'Ulysse Nardin',
+    'fpjourne.com':            'F.P. Journe',
+    'mbandf.com':              'MB&F',
+}
 
 
 def extract_article(url: str, logger: logging.Logger) -> Optional[Dict]:
@@ -697,49 +739,96 @@ def extract_article(url: str, logger: logging.Logger) -> Optional[Dict]:
 
 
 def extract_article_playwright(url: str, logger: logging.Logger) -> Optional[Dict]:
-    """Estrae contenuto con Playwright per pagine heavy-JS (Rolex, ecc.)"""
+    """Estrae contenuto con Playwright per pagine heavy-JS (Rolex, Tudor, Glashutte, ecc.)"""
     if not PLAYWRIGHT_AVAILABLE:
         return None
     
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
-                headless=False,
-                args=['--disable-blink-features=AutomationControlled', '--no-sandbox']
+                headless=True,  # MUST be True in CI/GitHub Actions (no display)
+                args=[
+                    '--disable-blink-features=AutomationControlled',
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                ]
             )
             context = browser.new_context(
                 user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 viewport={'width': 1920, 'height': 1080},
-                locale='it-IT',
-                timezone_id='Europe/Rome',
+                locale='en-US',
+                timezone_id='America/New_York',
             )
             context.set_extra_http_headers({
-                'Accept-Language': 'it-IT,it;q=0.9,en-US;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
                 'DNT': '1',
             })
             
             page = context.new_page()
             page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
             
-            # CRITICAL: domcontentloaded per brand con lazy loading infinito
-            page.goto(url, wait_until='domcontentloaded', timeout=45000)
-            page.wait_for_timeout(4000)  # Aspetta JS iniziale
+            # domcontentloaded è più veloce e affidabile di networkidle per brand JS-heavy
+            page.goto(url, wait_until='domcontentloaded', timeout=25000)
+            page.wait_for_timeout(2500)
             
             # Scroll per triggerare lazy content
             try:
                 page.evaluate('window.scrollTo(0, document.body.scrollHeight / 2)')
-                page.wait_for_timeout(1000)
+                page.wait_for_timeout(800)
             except:
                 pass
             
             title = page.title()
-            text = page.evaluate('''
-                () => {
-                    const unwanted = document.querySelectorAll('script, style, nav, footer, header, .cookie, .modal');
-                    unwanted.forEach(el => el.remove());
-                    return document.body.innerText || '';
-                }
-            ''')
+
+            # Estrai metadati da meta tags (date e author)
+            meta = page.evaluate('''() => {
+                const get = (sel) => {
+                    const el = document.querySelector(sel);
+                    return el ? (el.getAttribute("content") || el.getAttribute("datetime") || el.textContent || "").trim() : null;
+                };
+                return {
+                    date: get('meta[property="article:published_time"]')
+                       || get('meta[name="date"]')
+                       || get('meta[name="publish_date"]')
+                       || get('meta[name="DC.date"]')
+                       || get('meta[itemprop="datePublished"]')
+                       || get('time[itemprop="datePublished"]')
+                       || get('time[datetime]')
+                       || null,
+                    author: get('meta[name="author"]')
+                          || get('meta[property="article:author"]')
+                          || get('[itemprop="author"] [itemprop="name"]')
+                          || get('[rel="author"]')
+                          || null,
+                    description: get('meta[name="description"]')
+                               || get('meta[property="og:description"]')
+                               || null,
+                };
+            }''')
+
+            # Prova prima selettori semantici di contenuto, poi fallback su body
+            text = page.evaluate('''() => {
+                const unwanted = document.querySelectorAll(
+                    "script, style, nav, footer, header, " +
+                    "[class*='cookie'], [class*='modal'], [class*='popup'], " +
+                    "[class*='banner'], [id*='cookie'], [id*='modal'], " +
+                    "[class*='newsletter'], [class*='social'], [class*='share'], " +
+                    "[class*='related'], [class*='sidebar'], [class*='menu']"
+                );
+                unwanted.forEach(el => el.remove());
+                // Prova selettori semantici comuni sui siti brand luxury
+                const main = document.querySelector(
+                    "article, [role='main'], main, " +
+                    "[class*='article__body'], [class*='article-body'], " +
+                    "[class*='content-body'], [class*='post-content'], " +
+                    "[class*='entry-content'], [class*='page-content'], " +
+                    "[class*='product-description'], [class*='watch-description'], " +
+                    "[class*='editorial'], [class*='story'], [class*='news-detail']"
+                );
+                return (main || document.body).innerText || "";
+            }''')
             
             browser.close()
             
@@ -747,13 +836,19 @@ def extract_article_playwright(url: str, logger: logging.Logger) -> Optional[Dic
             
             if not text or len(text) < 100:
                 return None
+
+            # Normalizza data: tronca a YYYY-MM-DD se è ISO timestamp completo
+            date_val = meta.get('date') if meta else None
+            if date_val and len(date_val) >= 10:
+                date_val = date_val[:10]
             
             return {
-                'source_url': url,
-                'title': title,
-                'text': text,
-                'date': None,
-                'authors': None
+                'source_url':  url,
+                'title':       title,
+                'text':        text,
+                'date':        date_val,
+                'authors':     meta.get('author') if meta else None,
+                'description': meta.get('description') if meta else None,
             }
             
     except Exception as e:
@@ -869,6 +964,9 @@ def process_site(
                 '/fr/', '/de/', '/it/', '/es/', '/ja/', '/zh/', '/ko/', '/ru/',
                 '/pt/', '/nl/', '/pl/', '/tr/', '/ar/', '/cs/', '/hu/', '/ro/',
                 '/da/', '/sv/', '/fi/', '/nb/', '/he/', '/th/', '/vi/',
+                '/zhs/', '/zht/', '/zh-hk/', '/zhs-hk/', '/zht-tw/',
+                # Cartier/Omega usano en-us, en-gb ecc. — teniamo solo /com/ o bare /en/
+                '/en-us/', '/en-gb/', '/en-au/', '/en-sg/', '/en-hk/', '/en-ae/',
             )
             _JUNK_SEGMENTS = (
                 '/boutiques/', '/points-of-sale/', '/points-de-vente/',
@@ -880,10 +978,16 @@ def process_site(
                 '/service/enquiry', '/enquiry',
                 'fbclid=',
             )
+            import re as _re
+            _locale_pattern = _re.compile(r'^/[a-z]{2}-[a-z]{2}/', _re.IGNORECASE)
             filtered = []
             for u in urls:
                 parsed_path = '/' + '/'.join(u.split('?')[0].split('/')[3:])
                 if any(parsed_path.startswith(lp) for lp in _LANG_PREFIXES):
+                    continue
+                # Cattura qualsiasi /xx-XX/ locale code (es. zhs-hk, en-us, fr-ch)
+                # Eccezione: /en/ semplice è OK
+                if _locale_pattern.match(parsed_path):
                     continue
                 if any(seg in u for seg in _JUNK_SEGMENTS):
                     continue
@@ -941,7 +1045,11 @@ def process_site(
                     art['source_domain'] = domain
                     art['source_path'] = parsed_url.path
                     art['crawled_at'] = datetime.utcnow().isoformat() + 'Z'
-                    art['brand'] = extract_brand(art['text'][:1000])
+                    # Siti brand: domain map (certo). Blog: text scan.
+                    _domain_brand = next(
+                        (b for k, b in _DOMAIN_BRAND_MAP.items() if k in domain), None
+                    )
+                    art['brand'] = _domain_brand or extract_brand(art['text'][:1000])
                     
                     with lock:
                         with open(articles_file, 'a', encoding='utf-8') as f:
