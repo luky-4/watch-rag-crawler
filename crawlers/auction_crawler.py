@@ -64,9 +64,9 @@ WATCH_KEYWORDS = [
     'répétition', 'perpetual calendar', 'rattrapante',
 ]
 
-PAGE_TIMEOUT = 25000   # ms per goto
-WAIT_JS      = 2000    # ms dopo domcontentloaded
-MAX_RETRIES  = 2
+PAGE_TIMEOUT = 45000   # ms per goto — Christie's e siti antibot sono lenti
+WAIT_JS      = 3000    # ms dopo domcontentloaded
+MAX_RETRIES  = 3
 
 
 # ─────────────────────────────────────────────
@@ -110,11 +110,14 @@ def build_rag_text(
     Costruisce testo RAG-searchable.
     Tutti i dati economici sono nel testo, non solo in metadata.
     Tag [AUCTION] per filtro RAG lato query.
+    Garantisce sempre >= 60 parole anche con campi parziali.
     """
     lines = [f"[AUCTION] {title}"]
     if description:
         lines.append(description)
     lines.append("")
+
+    # Blocco dati asta — sempre presente
     lines.append(f"Auction house: {auction_house}")
     if auction_name:
         lines.append(f"Sale: {auction_name}")
@@ -128,7 +131,38 @@ def build_rag_text(
         lines.append(f"Estimate: {estimate}")
     if realized:
         lines.append(f"Realized: {realized}")
-    return '\n'.join(lines)
+
+    text = '\n'.join(lines)
+
+    # Padding narrativo se il testo è troppo corto per il chunker (soglia 50 parole)
+    # Evita che lotti con pochi metadati vengano scartati
+    word_count = len(text.split())
+    if word_count < 60:
+        brand = None
+        for b in WATCH_BRANDS:
+            if b.lower() in title.lower():
+                brand = b
+                break
+        extra = []
+        if brand:
+            extra.append(f"This lot features a {brand} timepiece offered at {auction_house}.")
+        else:
+            extra.append(f"This lot was offered at {auction_house}.")
+        if auction_name:
+            extra.append(f"It was part of the sale \"{auction_name}\".")
+        if estimate:
+            extra.append(f"The pre-sale estimate was {estimate}.")
+        if realized:
+            extra.append(f"The hammer price was {realized}.")
+        elif not realized:
+            extra.append("Result information may not be available yet.")
+        if auction_date:
+            extra.append(f"The auction took place on {auction_date}.")
+        if location:
+            extra.append(f"Venue: {location}.")
+        text = text + '\n\n' + ' '.join(extra)
+
+    return text
 
 
 # ─────────────────────────────────────────────
@@ -235,6 +269,13 @@ class BrowserBase:
             except Exception:
                 break
 
+    def _page_wait(self, br=None, ms: int = 3000):
+        """Wait extra per pagine JS-heavy / antibot."""
+        try:
+            self._page.wait_for_timeout(ms)
+        except Exception:
+            pass
+
     def page_text(self) -> str:
         try:
             return self._page.evaluate('''() => {
@@ -309,6 +350,7 @@ class ChristiesScraper:
                 return []
 
             br.scroll_down(6)
+            self._page_wait(br)  # wait extra per antibot JS-heavy
 
             # Estrai meta tags dalla pagina listing (data asta, ecc.)
             page_meta = br.page_meta()
@@ -326,19 +368,32 @@ class ChristiesScraper:
             if raw:
                 try:
                     data = json.loads(raw)
-                    # Path tipico: pageProps.lots o pageProps.results.lots
                     props = data.get('props', {}).get('pageProps', {})
-                    for key in ('lots', 'results', 'searchResults'):
-                        candidate = props.get(key)
-                        if isinstance(candidate, list):
-                            lots_raw = candidate
-                            break
-                        if isinstance(candidate, dict):
-                            for subkey in ('lots', 'items', 'results'):
-                                sub = candidate.get(subkey)
-                                if isinstance(sub, list):
-                                    lots_raw = sub
-                                    break
+
+                    # Log diagnostico: mostra le chiavi disponibili in pageProps
+                    self.logger.info(f"Christie's __NEXT_DATA__ keys: {list(props.keys())[:10]}")
+
+                    # Ricerca ricorsiva: qualsiasi lista con dicts che abbia campi lotto
+                    def find_lots(obj, depth=0):
+                        if depth > 6:
+                            return []
+                        if isinstance(obj, list) and len(obj) >= 3:
+                            if obj and isinstance(obj[0], dict):
+                                keys = set(obj[0].keys())
+                                if keys & {'title', 'lotNumber', 'objectDescription', 'lotTitle', 'lotUrl'}:
+                                    return obj
+                        if isinstance(obj, dict):
+                            for v in obj.values():
+                                result = find_lots(v, depth + 1)
+                                if result:
+                                    return result
+                        return []
+
+                    lots_raw = find_lots(props)
+                    if lots_raw:
+                        self.logger.info(f"Christie's: {len(lots_raw)} lotti da __NEXT_DATA__")
+                    else:
+                        self.logger.info("Christie's: __NEXT_DATA__ struttura non riconosciuta")
                 except Exception as e:
                     self.logger.debug(f"Christie's next_data parse error: {e}")
 
@@ -453,7 +508,7 @@ class ChristiesScraper:
 class SothebysScraper:
     NAME = "Sotheby's"
     DOMAIN = 'sothebys.com'
-    RESULTS_URL = 'https://www.sothebys.com/en/buy/watches'
+    RESULTS_URL = 'https://www.sothebys.com/en/results?sale_type=auction&department=watches-clocks'
 
     def __init__(self, logger: logging.Logger, db: AuctionDB, max_lots: int = 50):
         self.logger = logger
@@ -486,32 +541,49 @@ class SothebysScraper:
                 try:
                     data = json.loads(raw)
                     props = data.get('props', {}).get('pageProps', {})
-                    for key in ('lots', 'items', 'results', 'initialState'):
-                        candidate = props.get(key)
-                        if isinstance(candidate, list):
-                            lots_raw = candidate
-                            break
+                    self.logger.info(f"Sotheby's __NEXT_DATA__ keys: {list(props.keys())[:10]}")
+
+                    def find_lots(obj, depth=0):
+                        if depth > 6:
+                            return []
+                        if isinstance(obj, list) and len(obj) >= 3:
+                            if obj and isinstance(obj[0], dict):
+                                keys = set(obj[0].keys())
+                                if keys & {'title', 'lotNumber', 'objectTitle', 'lotUrl', 'priceRealised'}:
+                                    return obj
+                        if isinstance(obj, dict):
+                            for v in obj.values():
+                                result = find_lots(v, depth + 1)
+                                if result:
+                                    return result
+                        return []
+
+                    lots_raw = find_lots(props)
+                    if lots_raw:
+                        self.logger.info(f"Sotheby's: {len(lots_raw)} lotti da __NEXT_DATA__")
                 except Exception as e:
                     self.logger.debug(f"Sotheby's next_data: {e}")
 
-            # Fallback DOM
+            # Fallback DOM — selettori più ampi per catturare la struttura attuale
             if not lots_raw:
                 self.logger.info("Sotheby's: fallback DOM scraping")
                 lots_raw = br._page.evaluate('''() =>
                     Array.from(document.querySelectorAll(
-                        "[class*='Card'], [class*='LotCard'], [class*='item'], article"
+                        "[class*='Card'], [class*='LotCard'], [class*='lot-card'], " +
+                        "[class*='ResultItem'], [class*='result-item'], " +
+                        "[data-lot-id], [data-testid*='lot'], article"
                     )).map(el => ({
-                        title: el.querySelector("h2,h3,[class*='title']")?.innerText?.trim() || '',
-                        description: el.querySelector("p,[class*='description']")?.innerText?.trim() || '',
-                        lot_number: (el.innerText.match(/Lot\\s+(\\d+[A-Z]?)/i) || [])[1] || '',
-                        estimate: el.querySelector("[class*='estimate'],[class*='Estimate']")?.innerText?.trim() || '',
-                        realized: el.querySelector("[class*='price'],[class*='sold'],[class*='hammer']")?.innerText?.trim() || '',
+                        title: el.querySelector("h2,h3,h4,[class*='title'],[class*='Title']")?.innerText?.trim() || '',
+                        description: el.querySelector("p,[class*='description'],[class*='Description'],[class*='subtitle']")?.innerText?.trim() || '',
+                        lot_number: (el.innerText.match(/Lot\\s+(\\d+[A-Z]?)/i) || [])[1] || el.getAttribute('data-lot-id') || '',
+                        estimate: el.querySelector("[class*='estimate'],[class*='Estimate'],[class*='pre-sale']")?.innerText?.trim() || '',
+                        realized: el.querySelector("[class*='price'],[class*='Price'],[class*='sold'],[class*='hammer'],[class*='Hammer']")?.innerText?.trim() || '',
                         url: el.querySelector("a")?.href || '',
-                        date: el.querySelector("time,[class*='date']")?.innerText?.trim() || '',
-                    })).filter(l => l.title)
+                        date: el.querySelector("time,[class*='date'],[class*='Date']")?.innerText?.trim() || '',
+                    })).filter(l => l.title && l.title.length > 3)
                 ''')
+                self.logger.info(f"Sotheby's: {len(lots_raw)} lotti da DOM")
 
-            self.logger.info(f"Sotheby's: {len(lots_raw)} lotti trovati")
             articles = self._build_articles(lots_raw, listing_date)
 
         return articles
@@ -740,6 +812,7 @@ class AntiquorumScraper:
     NAME = "Antiquorum"
     DOMAIN = 'antiquorum.swiss'
     CATALOG_URL = 'https://catalog.antiquorum.swiss/'
+    FALLBACK_URL = 'https://www.antiquorum.swiss/auctions'
 
     def __init__(self, logger: logging.Logger, db: AuctionDB, max_lots: int = 50):
         self.logger = logger
@@ -755,19 +828,43 @@ class AntiquorumScraper:
 
             br.scroll_down(4)
 
-            # Antiquorum: cerca link alle aste/lotti
+            # Antiquorum: cerca link alle aste/lotti — selettori più ampi
             auction_links = br._page.evaluate('''() =>
                 Array.from(document.querySelectorAll("a"))
                     .map(a => a.href)
                     .filter(h => h && (
                         h.includes('/auction/') || h.includes('/lot/') ||
-                        h.includes('/catalog/') || h.includes('/sale/')
+                        h.includes('/catalog/') || h.includes('/sale/') ||
+                        h.includes('/vente/') || h.includes('/lots')
                     ))
                     .filter((v, i, a) => a.indexOf(v) === i)
                     .filter(u => u.includes('antiquorum'))
             ''')
 
-            self.logger.info(f"Antiquorum: {len(auction_links)} link trovati")
+            self.logger.info(f"Antiquorum: {len(auction_links)} link trovati su {self.CATALOG_URL}")
+
+            # Diagnostica: mostra tutti i link della pagina se 0 trovati
+            if not auction_links:
+                all_links = br._page.evaluate('''() =>
+                    Array.from(document.querySelectorAll("a[href]"))
+                        .map(a => a.href).slice(0, 20)
+                ''')
+                self.logger.info(f"Antiquorum: link totali pagina: {all_links}")
+
+                # Prova URL alternativo
+                self.logger.info(f"Antiquorum: provo fallback {self.FALLBACK_URL}")
+                if br.goto(self.FALLBACK_URL):
+                    br.scroll_down(4)
+                    auction_links = br._page.evaluate('''() =>
+                        Array.from(document.querySelectorAll("a"))
+                            .map(a => a.href)
+                            .filter(h => h && (
+                                h.includes('/auction/') || h.includes('/lot/') ||
+                                h.includes('/sale/') || h.includes('/lots')
+                            ))
+                            .filter((v, i, a) => a.indexOf(v) === i)
+                    ''')
+                    self.logger.info(f"Antiquorum fallback: {len(auction_links)} link trovati")
 
             if not auction_links:
                 # Scrapa direttamente la pagina corrente

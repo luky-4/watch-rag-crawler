@@ -961,14 +961,28 @@ def process_site(
         # Per siti brand: filtra solo categorie non rilevanti e pagine funzionali
         if mode == 'brand':
             _JUNK_SEGMENTS = (
+                # Negozi e distribuzione
                 '/boutiques/', '/points-of-sale/', '/points-de-vente/',
                 '/dealers/', '/stores/', '/retailers/', '/stockists/',
-                '/bags-and-accessories/', '/sunglasses/', '/jewellery/',
-                '/jewelry/', '/perfumes/', '/fragrances/', '/lighters/',
+                '/retailers/', '/find-a-retailer/', '/store-locator/',
+                '/points-de-vente/', '/revendeurs/', '/rivenditori/',
+                # Non-watch product categories
+                '/bags-and-accessories/', '/our-sunglasses/', '/sunglasses/',
+                '/jewellery/', '/jewelry/', '/joaillerie/', '/fine-jewellery/',
+                '/perfumes/', '/fragrances/', '/parfums/',
+                '/lighters/', '/accessories/', '/eyewear/',
+                '/ready-to-wear/', '/fashion/', '/lifestyle/',
+                # Pagine funzionali utente
                 '/my-', '/myomega/', '/my-favourites/', '/wishlist/',
-                '/cart/', '/checkout/', '/account/', '/login/',
-                '/service/enquiry', '/enquiry',
-                'fbclid=',
+                '/cart/', '/checkout/', '/account/', '/login/', '/register/',
+                '/service/enquiry', '/enquiry', '/contact/',
+                # Pagine legali/istituzionali
+                '/legal/', '/mentions-legales/', '/conditions-generales/',
+                '/privacy/', '/cookie/', '/terms/', '/impressum/',
+                '/aviso-legal/', '/note-legali/', '/datenschutz/',
+                '/sitemap', '/robots', '/search?', '/recherche?',
+                # Tracking/junk query params
+                'fbclid=', 'utm_', 'gclid=',
             )
             before = len(urls)
             urls = [u for u in urls if not any(seg in u for seg in _JUNK_SEGMENTS)]
