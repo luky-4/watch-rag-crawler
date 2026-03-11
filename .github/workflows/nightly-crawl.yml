@@ -210,4 +210,66 @@ jobs:
           else
             echo "⚠️ Nessun log trovato"
           fi
-      
+
+      # ── AUCTION PIPELINE ────────────────────────────────────────────
+
+      - name: 🏛️ Run Auction Crawler
+        if: success() || failure()
+        env:
+          AUCTION_SITES: ${{ secrets.AUCTION_SITES }}
+          MAX_AUCTION_LOTS: ${{ vars.MAX_AUCTION_LOTS || '100' }}
+        run: |
+          mkdir -p output/auctions
+          python3 crawlers/auction_crawler.py \
+            --out ./output/auctions \
+            --max-lots $MAX_AUCTION_LOTS
+        continue-on-error: true
+
+      - name: 🔨 Chunk Auction Articles
+        if: success() || failure()
+        run: |
+          if [ -d output/auctions ] && [ "$(ls output/auctions/*.jsonl 2>/dev/null | wc -l)" -gt 0 ]; then
+            python3 processing/chunker.py \
+              -i ./output/auctions \
+              -o ./output/auctions/chunks \
+              --chunk-size 300
+          else
+            echo "⚠️ Nessun JSONL aste trovato, skip chunker"
+          fi
+        continue-on-error: true
+
+      - name: 📤 Upload Auction Chunks to Supabase
+        if: success() || failure()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -d output/auctions/chunks ] && [ "$(ls output/auctions/chunks/*.jsonl 2>/dev/null | wc -l)" -gt 0 ]; then
+            python3 processing/upload_supabase.py \
+              -i ./output/auctions/chunks \
+              --batch-size 100
+          else
+            echo "⚠️ Nessun chunk aste trovato, skip upload"
+          fi
+        continue-on-error: true
+
+      - name: 🗄️ Backup Auction DB to Supabase Storage
+        if: always()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          if [ -f output/auctions/auction_crawler.db ]; then
+            gzip -c output/auctions/auction_crawler.db > auction_crawler.db.gz
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+              "$SUPABASE_URL/storage/v1/object/crawler-dbs/auction_crawler.db.gz" \
+              -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+              -H "Content-Type: application/octet-stream" \
+              -H "x-upsert: true" \
+              --data-binary @auction_crawler.db.gz)
+            [ "$HTTP" = "200" ] && echo "✅ auction_crawler.db.gz uploadato" || echo "❌ Upload fallito (HTTP $HTTP)"
+          else
+            echo "⚠️ auction_crawler.db non trovato, skip backup"
+          fi
+
