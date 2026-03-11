@@ -958,16 +958,8 @@ def process_site(
                 logger.error(f"Discovery error: {e}")
                 urls = list(_partial) if _partial else []
 
-        # Per siti brand: filtra URL non-inglesi e categorie non rilevanti
+        # Per siti brand: filtra solo categorie non rilevanti e pagine funzionali
         if mode == 'brand':
-            _LANG_PREFIXES = (
-                '/fr/', '/de/', '/it/', '/es/', '/ja/', '/zh/', '/ko/', '/ru/',
-                '/pt/', '/nl/', '/pl/', '/tr/', '/ar/', '/cs/', '/hu/', '/ro/',
-                '/da/', '/sv/', '/fi/', '/nb/', '/he/', '/th/', '/vi/',
-                '/zhs/', '/zht/', '/zh-hk/', '/zhs-hk/', '/zht-tw/',
-                # Cartier/Omega usano en-us, en-gb ecc. — teniamo solo /com/ o bare /en/
-                '/en-us/', '/en-gb/', '/en-au/', '/en-sg/', '/en-hk/', '/en-ae/',
-            )
             _JUNK_SEGMENTS = (
                 '/boutiques/', '/points-of-sale/', '/points-de-vente/',
                 '/dealers/', '/stores/', '/retailers/', '/stockists/',
@@ -978,23 +970,9 @@ def process_site(
                 '/service/enquiry', '/enquiry',
                 'fbclid=',
             )
-            import re as _re
-            _locale_pattern = _re.compile(r'^/[a-z]{2}-[a-z]{2}/', _re.IGNORECASE)
-            filtered = []
-            for u in urls:
-                parsed_path = '/' + '/'.join(u.split('?')[0].split('/')[3:])
-                if any(parsed_path.startswith(lp) for lp in _LANG_PREFIXES):
-                    continue
-                # Cattura qualsiasi /xx-XX/ locale code (es. zhs-hk, en-us, fr-ch)
-                # Eccezione: /en/ semplice è OK
-                if _locale_pattern.match(parsed_path):
-                    continue
-                if any(seg in u for seg in _JUNK_SEGMENTS):
-                    continue
-                filtered.append(u)
             before = len(urls)
-            urls = filtered
-            logger.info(f"Brand URL filter: {before} -> {len(urls)} (rimossi {before - len(urls)} non-EN/junk)")
+            urls = [u for u in urls if not any(seg in u for seg in _JUNK_SEGMENTS)]
+            logger.info(f"Brand URL filter: {before} -> {len(urls)} (rimossi {before - len(urls)} junk/non-watch)")
 
         # Fix: confronta URL normalizzati (rimuovi trailing slash e frammenti)
         crawled_urls_normalized = {url.rstrip('/').split('#')[0] for url in crawled_urls}
