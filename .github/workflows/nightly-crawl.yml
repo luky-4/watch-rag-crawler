@@ -102,22 +102,9 @@ jobs:
       - name: 🧹 Reset timezone.com (URL crawlati senza contenuto)
         run: |
           if [ -f output/crawler.db ]; then
-            python3 - << 'EOF'
-import sqlite3, os
-db_path = 'output/crawler.db'
-conn = sqlite3.connect(db_path)
-# Cancella URL timezone.com marcati come crawled ma con contenuto vuoto/nullo
-# Questo forza il re-crawl al prossimo run
-result = conn.execute("""
-    DELETE FROM crawled_urls
-    WHERE domain LIKE '%timezone%'
-      AND (content IS NULL OR content = '' OR length(content) < 100)
-""")
-deleted = result.rowcount
-conn.commit()
-conn.close()
-print(f"✅ timezone.com reset: {deleted} URL rimossi dal DB → verranno ri-crawlati")
-EOF
+            DELETED=$(sqlite3 output/crawler.db \
+              "DELETE FROM crawled_urls WHERE domain LIKE '%timezone%' AND (content IS NULL OR content = '' OR length(content) < 100); SELECT changes();")
+            echo "✅ timezone.com reset: $DELETED URL rimossi dal DB → verranno ri-crawlati"
           else
             echo "⚠️ crawler.db non trovato, skip reset"
           fi
