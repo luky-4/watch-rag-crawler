@@ -917,19 +917,20 @@ def process_site(
 
         # Per siti brand: filtra URL non-inglesi e categorie non rilevanti
         if mode == 'brand':
-            _LANG_PREFIXES = (
-                '/fr/', '/de/', '/it/', '/es/', '/ja/', '/zh/', '/ko/', '/ru/',
-                '/pt/', '/nl/', '/pl/', '/tr/', '/ar/', '/cs/', '/hu/', '/ro/',
-                '/da/', '/sv/', '/fi/', '/nb/', '/he/', '/th/', '/vi/',
-                # Country/lang annidati (es. Tag Heuer: /ch/hans/, /jp/ja/, /au/hans/)
-                # Pattern: /<country-2char>/<lang>/ dove lang è non-EN
-                '/hans/', '/hant/',                     # cinese semplificato/tradizionale
-                '/ja-', '/ko-', '/zh-', '/ru-',         # lang dash variants
-            )
-            # Pattern più robusto per URL tipo /ch/hans/... /jp/ja/... /au/hans/...
-            _COUNTRY_LANG_RE = re.compile(
+            # Filtro lingua: approccio WHITELIST
+            # Teniamo URL senza prefisso lingua, o con prefisso EN (en, en-gb, en-us, us-en, en-hk...)
+            # Scartiamo tutto il resto (fr, de, it, zh, tr, pt-br, ar, jp/ja, ch/hans...)
+            _NON_EN_LANGS = {
+                'fr','de','it','es','ja','zh','ko','ru','pt','nl','pl','tr',
+                'ar','cs','hu','ro','da','sv','fi','nb','he','th','vi',
+                'hans','hant','zhs','zht',
+            }
+            # Matcha prefisso tipo /xx/ o /xx-yy/ (es. /en-gb/, /fr/, /pt-br/)
+            _NONLANG_PREFIX_RE = re.compile(r'^/[a-z]{2}(-[a-z]{2})?/', re.IGNORECASE)
+            # Matcha pattern annidato /country/lang/ (es. /jp/ja/, /ch/hans/)
+            _NESTED_LANG_RE = re.compile(
                 r'^/[a-z]{2}/(fr|de|it|es|ja|zh|ko|ru|pt|nl|pl|tr|ar|cs|hu|ro'
-                r'|da|sv|fi|nb|he|th|vi|hans|hant)(/|$)',
+                r'|da|sv|fi|nb|he|th|vi|hans|hant|zhs|zht)(/|$)',
                 re.IGNORECASE
             )
             _JUNK_SEGMENTS = (
@@ -937,6 +938,7 @@ def process_site(
                 '/boutiques/', '/points-of-sale/', '/points-de-vente/',
                 '/dealers/', '/stores/', '/retailers/', '/stockists/',
                 '/find-a-retailer/', '/store-locator/', '/revendeurs/', '/rivenditori/',
+                '/rolex-dealers/',
                 # Non-watch products
                 '/bags-and-accessories/', '/sunglasses/', '/our-sunglasses/',
                 '/jewellery/', '/jewelry/', '/fine-jewellery/',
@@ -963,16 +965,33 @@ def process_site(
                 '/sitemap', '/robots',
                 # Query params tracciamento
                 'fbclid=', 'utm_', 'gclid=',
+                # Certified pre-owned (dealer redirect)
+                '/certified-pre-owned',
             )
             filtered = []
             for u in urls:
                 parsed_path = '/' + '/'.join(u.split('?')[0].split('/')[3:])
-                if any(parsed_path.startswith(lp) for lp in _LANG_PREFIXES):
-                    continue
-                if _COUNTRY_LANG_RE.match(parsed_path):
-                    continue
+
+                # Scarta junk segments
                 if any(seg in u for seg in _JUNK_SEGMENTS):
                     continue
+
+                # Scarta pattern /country/lang/ annidato (es. /jp/ja/, /ch/hans/)
+                if _NESTED_LANG_RE.match(parsed_path):
+                    continue
+
+                # Scarta URL con prefisso lingua non-EN
+                m = _NONLANG_PREFIX_RE.match(parsed_path)
+                if m:
+                    prefix = m.group(0).strip('/')
+                    parts = prefix.split('-')
+                    lang = parts[0].lower()
+                    country = parts[1].lower() if len(parts) > 1 else ''
+                    is_en = (lang == 'en') or (country == 'en')
+                    is_non_en = (lang in _NON_EN_LANGS) or (country in _NON_EN_LANGS)
+                    if is_non_en and not is_en:
+                        continue
+
                 filtered.append(u)
             before = len(urls)
             urls = filtered
