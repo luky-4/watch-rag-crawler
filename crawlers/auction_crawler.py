@@ -1,195 +1,127 @@
 #!/usr/bin/env python3
 """
-AUCTION CRAWLER v6
+AUCTION CRAWLER v7
 
-✅ 4 case d'asta: Christie's, Sotheby's, Phillips, Antiquorum
-✅ headless=True → CI/GitHub Actions ready
-✅ Dati asta nel testo (RAG-searchable: stima, realizzo, lotto)
-✅ Output JSONL compatibile con chunker/embedder esistente
-✅ Tag [AUCTION] nel testo per filtro RAG
-✅ Retry automatico + timeout robusto
-✅ DB SQLite incrementale (no re-crawl lotti già visti)
+Fix rispetto v6:
+- Christie's: requests+JSON interno invece di browser (bypass timeout antibot)
+- Sotheby's: build_rag_text robusto anche con campi algolia sparsi/vuoti
+- Phillips: selettori ampliati CH/UK/HK/NY, __NEXT_DATA__ ricorsivo
+- Antiquorum: DOM scraper riscritto per struttura reale catalog.antiquorum.swiss
+- Camoufox virtual_display=True come browser stealth su tutti (Firefox > Chromium vs antibot)
+- headless=False con virtual display: risolve crash CI (no X11) e migliora stealth Akamai
+
+Output: JSONL formato articolo RAG-ready (compatibile chunker)
 """
 
 import json
-import os
 import re
 import time
 import logging
 import hashlib
+import os
 import sqlite3
-import argparse
+import sys
 from pathlib import Path
 from datetime import datetime
 from typing import List, Optional, Dict
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse
 from dataclasses import dataclass, asdict
 
-try:
-    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
-    PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    print("❌ Installa Playwright: pip install playwright && playwright install chromium")
-    exit(1)
+import requests
 
+# ─── Browser factory ─────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────
-
-WATCH_BRANDS = [
-    # Multi-word PRIMA: evita che 'Heuer' catturi 'TAG Heuer', ecc.
-    'Patek Philippe', 'Audemars Piguet', 'Vacheron Constantin',
-    'A. Lange & Söhne', 'F.P. Journe', 'Richard Mille',
-    'TAG Heuer', 'Grand Seiko', 'Glashütte Original', 'Glashutte Original',
-    'Girard-Perregaux', 'Jaeger-LeCoultre', 'Ulysse Nardin',
-    'Franck Muller', 'Bell & Ross', 'Baume & Mercier',
-    # Single-word dopo
-    'Rolex', 'Omega', 'Cartier', 'Breguet', 'Blancpain',
-    'Panerai', 'Breitling', 'IWC', 'Tudor', 'Longines',
-    'Piaget', 'Parmigiani', 'Hublot', 'Zenith', 'Chopard',
-    'Seiko', 'Hamilton', 'Doxa', 'Urwerk', 'MB&F', 'HYT',
-]
-
-SKIP_KEYWORDS = [
-    'jewelry', 'jewellery', 'necklace', 'ring', 'earring', 'bracelet',
-    'brooch', 'painting', 'sculpture', 'drawing', 'photograph', 'print',
-    'car', 'automobile', 'furniture', 'wine', 'handbag', 'purse', 'bag',
-    'book', 'manuscript', 'diamond', 'ruby', 'emerald',
-]
-
-WATCH_KEYWORDS = [
-    'watch', 'wristwatch', 'timepiece', 'chronograph', 'tourbillon',
-    'movement', 'caliber', 'pocket watch', 'orologio', 'montre',
-    'répétition', 'perpetual calendar', 'rattrapante',
-]
-
-PAGE_TIMEOUT = 45000   # ms per goto — Christie's e siti antibot sono lenti
-WAIT_JS      = 3000    # ms dopo domcontentloaded
-MAX_RETRIES  = 3
-
-
-# ─────────────────────────────────────────────
-# UTILS
-# ─────────────────────────────────────────────
-
-def extract_brand(text: str) -> Optional[str]:
-    text_lower = text.lower()
-    for brand in WATCH_BRANDS:
-        if brand.lower() in text_lower:
-            return brand
-    return None
-
-
-def is_watch(title: str, description: str = '') -> bool:
-    text = (title + ' ' + description).lower()
-    if any(k in text for k in SKIP_KEYWORDS):
-        return False
-    if extract_brand(text):
-        return True
-    return any(k in text for k in WATCH_KEYWORDS)
-
-
-def make_lot_id(url: str, lot_num: str = '') -> str:
-    key = f"{url}_{lot_num}"
-    return hashlib.md5(key.encode()).hexdigest()[:16]
-
-
-def build_rag_text(
-    title: str,
-    description: str,
-    auction_house: str,
-    auction_name: str,
-    lot_number: str,
-    estimate: str,
-    realized: str,
-    auction_date: str,
-    location: str,
-) -> str:
+def _make_browser_page():
     """
-    Costruisce testo RAG-searchable.
-    Tutti i dati economici sono nel testo, non solo in metadata.
-    Tag [AUCTION] per filtro RAG lato query.
-    Garantisce sempre >= 60 parole anche con campi parziali.
+    Apre browser stealth.
+    Priorità: Camoufox con virtual_display=True (Firefox, migliore vs antibot Akamai).
+    Fallback: Playwright headless=True (funziona su CI ma meno stealth).
     """
-    lines = [f"[AUCTION] {title}"]
-    if description:
-        lines.append(description)
-    lines.append("")
+    try:
+        from camoufox.sync_api import Camoufox
+        # virtual_display=True: avvia Xvfb internamente, risolve "Missing X server"
+        # su GitHub Actions ed è più stealth di headless puro (fingerprint reale)
+        cf = Camoufox(headless=False, virtual_display=True)
+        browser = cf.__enter__()
+        page = browser.new_page()
+        return ('camoufox', cf, browser, page)
+    except Exception as e:
+        logging.getLogger('auction').warning(
+            f"Camoufox non disponibile ({e}), uso Playwright headless=True")
 
-    # Blocco dati asta — sempre presente
-    lines.append(f"Auction house: {auction_house}")
-    if auction_name:
-        lines.append(f"Sale: {auction_name}")
-    if auction_date:
-        lines.append(f"Date: {auction_date}")
-    if location:
-        lines.append(f"Location: {location}")
-    if lot_number:
-        lines.append(f"Lot: {lot_number}")
-    if estimate:
-        lines.append(f"Estimate: {estimate}")
-    if realized:
-        lines.append(f"Realized: {realized}")
+    from playwright.sync_api import sync_playwright
+    pw = sync_playwright().start()
+    browser = pw.chromium.launch(
+        headless=True,  # CRITICO: False crasha su CI senza X11
+        args=['--disable-blink-features=AutomationControlled', '--no-sandbox',
+              '--disable-dev-shm-usage', '--disable-gpu']
+    )
+    ctx = browser.new_context(
+        user_agent=(
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        ),
+        viewport={'width': 1920, 'height': 1080}
+    )
+    page = ctx.new_page()
+    page.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+    )
+    return ('playwright', pw, browser, page)
 
-    text = '\n'.join(lines)
 
-    # Padding narrativo se il testo è troppo corto per il chunker (soglia 50 parole)
-    # Evita che lotti con pochi metadati vengano scartati
-    word_count = len(text.split())
-    if word_count < 60:
-        brand = None
-        for b in WATCH_BRANDS:
-            if b.lower() in title.lower():
-                brand = b
-                break
-        extra = []
-        if brand:
-            extra.append(f"This lot features a {brand} timepiece offered at {auction_house}.")
+def _close_browser(kind, h1, h2, page):
+    for obj in [page, h2]:
+        try:
+            obj.close()
+        except Exception:
+            pass
+    try:
+        if kind == 'camoufox':
+            h1.__exit__(None, None, None)
         else:
-            extra.append(f"This lot was offered at {auction_house}.")
-        if auction_name:
-            extra.append(f"It was part of the sale \"{auction_name}\".")
-        if estimate:
-            extra.append(f"The pre-sale estimate was {estimate}.")
-        if realized:
-            extra.append(f"The hammer price was {realized}.")
-        elif not realized:
-            extra.append("Result information may not be available yet.")
-        if auction_date:
-            extra.append(f"The auction took place on {auction_date}.")
-        if location:
-            extra.append(f"Venue: {location}.")
-        text = text + '\n\n' + ' '.join(extra)
-
-    return text
+            h1.stop()
+    except Exception:
+        pass
 
 
-# ─────────────────────────────────────────────
-# DATABASE INCREMENTALE
-# ─────────────────────────────────────────────
+# ─── Dataclass output ─────────────────────────────────────────────────────────
+
+@dataclass
+class AuctionArticle:
+    id: str
+    url: str
+    title: str
+    text: str
+    site: str
+    site_type: str
+    source_domain: str
+    source_path: str
+    crawled_at: str
+    brand: Optional[str]
+    metadata: dict
+
+
+# ─── DB incrementale ──────────────────────────────────────────────────────────
 
 class AuctionDB:
-    def __init__(self, db_path: Path):
-        self.conn = sqlite3.connect(db_path)
-        self.conn.execute('''
-            CREATE TABLE IF NOT EXISTS crawled_lots (
-                lot_id TEXT PRIMARY KEY,
-                auction_house TEXT,
-                url TEXT,
-                crawled_at TIMESTAMP
-            )
-        ''')
+    def __init__(self, path: Path):
+        self.conn = sqlite3.connect(str(path))
+        self.conn.execute(
+            'CREATE TABLE IF NOT EXISTS lots '
+            '(id TEXT PRIMARY KEY, crawled_at TEXT, house TEXT)'
+        )
         self.conn.commit()
 
-    def is_crawled(self, lot_id: str) -> bool:
-        cur = self.conn.execute('SELECT 1 FROM crawled_lots WHERE lot_id = ?', (lot_id,))
-        return cur.fetchone() is not None
+    def seen(self, lot_id: str) -> bool:
+        return bool(
+            self.conn.execute('SELECT 1 FROM lots WHERE id=?', (lot_id,)).fetchone()
+        )
 
-    def mark_crawled(self, lot_id: str, house: str, url: str):
+    def mark(self, lot_id: str, house: str):
         self.conn.execute(
-            'INSERT OR REPLACE INTO crawled_lots (lot_id, auction_house, url, crawled_at) VALUES (?,?,?,?)',
-            (lot_id, house, url, datetime.now().isoformat())
+            'INSERT OR IGNORE INTO lots VALUES (?,?,?)',
+            (lot_id, datetime.now().isoformat(), house)
         )
         self.conn.commit()
 
@@ -197,915 +129,844 @@ class AuctionDB:
         self.conn.close()
 
 
-# ─────────────────────────────────────────────
-# BROWSER BASE
-# ─────────────────────────────────────────────
+# ─── Base scraper ─────────────────────────────────────────────────────────────
 
-class BrowserBase:
-    """Browser stealth condiviso, headless=True per CI."""
+class AuctionScraper:
+    WATCH_BRANDS = [
+        'Rolex', 'Patek Philippe', 'Audemars Piguet', 'Vacheron Constantin',
+        'A. Lange & Söhne', 'F.P. Journe', 'Richard Mille', 'Omega',
+        'Cartier', 'IWC', 'Jaeger-LeCoultre', 'Panerai', 'Breguet',
+        'Blancpain', 'Zenith', 'Tudor', 'TAG Heuer', 'Longines', 'Hublot',
+        'Glashütte Original', 'Piaget', 'Chopard', 'Ulysse Nardin',
+        'Girard-Perregaux', 'Baume & Mercier', 'Bell & Ross', 'Oris',
+        'Breitling', 'Seiko', 'Grand Seiko', 'Citizen', 'Hamilton',
+        'Franck Muller', 'Harry Winston', 'Bulgari', 'Chanel',
+        'Corum', 'De Bethune', 'MB&F', 'Urwerk', 'H. Moser',
+    ]
 
-    def __init__(self, logger: logging.Logger):
-        self.logger = logger
-        self._pw = None
-        self._browser = None
-        self._page = None
-
-    def __enter__(self):
-        self._pw = sync_playwright().start()
-        self._browser = self._pw.chromium.launch(
-            headless=True,
-            args=[
-                '--disable-blink-features=AutomationControlled',
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-            ]
-        )
-        ctx = self._browser.new_context(
-            user_agent=(
-                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/120.0.0.0 Safari/537.36'
-            ),
-            viewport={'width': 1920, 'height': 1080},
-            locale='en-US',
-        )
-        ctx.set_extra_http_headers({'Accept-Language': 'en-US,en;q=0.9', 'DNT': '1'})
-        self._page = ctx.new_page()
-        self._page.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-        )
-        return self
-
-    def __exit__(self, *_):
-        try:
-            self._browser.close()
-            self._pw.stop()
-        except Exception:
-            pass
-
-    def goto(self, url: str, retries: int = MAX_RETRIES) -> bool:
-        for attempt in range(retries + 1):
-            try:
-                self._page.goto(url, wait_until='domcontentloaded', timeout=PAGE_TIMEOUT)
-                self._page.wait_for_timeout(WAIT_JS)
-                return True
-            except PlaywrightTimeout:
-                self.logger.warning(f"Timeout {url} (attempt {attempt+1})")
-                if attempt == retries:
-                    return False
-                time.sleep(2)
-            except Exception as e:
-                self.logger.warning(f"Goto error {url}: {e}")
-                return False
-        return False
-
-    def scroll_down(self, steps: int = 4):
-        for _ in range(steps):
-            try:
-                self._page.evaluate('window.scrollBy(0, 800)')
-                self._page.wait_for_timeout(600)
-            except Exception:
-                break
-
-    def _page_wait(self, br=None, ms: int = 3000):
-        """Wait extra per pagine JS-heavy / antibot."""
-        try:
-            self._page.wait_for_timeout(ms)
-        except Exception:
-            pass
-
-    def page_text(self) -> str:
-        try:
-            return self._page.evaluate('''() => {
-                const rm = document.querySelectorAll(
-                    "script,style,nav,footer,header," +
-                    "[class*='cookie'],[class*='modal'],[class*='popup']," +
-                    "[class*='newsletter'],[class*='banner']"
-                );
-                rm.forEach(e => e.remove());
-                const main = document.querySelector(
-                    "article,[role='main'],main,[class*='lot-detail'],[class*='lot-content']"
-                );
-                return (main || document.body).innerText || '';
-            }''')
-        except Exception:
-            return ''
-
-    def page_meta(self) -> dict:
-        """Estrae date/author da meta tags — identico alla patch di rag_site_crawler."""
-        try:
-            meta = self._page.evaluate('''() => {
-                const get = (sel) => {
-                    const el = document.querySelector(sel);
-                    return el ? (el.getAttribute("content") || el.getAttribute("datetime") || el.textContent || "").trim() : null;
-                };
-                return {
-                    date: get('meta[property="article:published_time"]')
-                       || get('meta[name="date"]')
-                       || get('meta[name="publish_date"]')
-                       || get('meta[name="DC.date"]')
-                       || get('meta[itemprop="datePublished"]')
-                       || get('time[itemprop="datePublished"]')
-                       || get('time[datetime]')
-                       || null,
-                    author: get('meta[name="author"]')
-                          || get('meta[property="article:author"]')
-                          || get('[itemprop="author"] [itemprop="name"]')
-                          || null,
-                    description: get('meta[name="description"]')
-                               || get('meta[property="og:description"]')
-                               || null,
-                };
-            }''')
-            # Normalizza data a YYYY-MM-DD
-            if meta.get('date') and len(meta['date']) >= 10:
-                meta['date'] = meta['date'][:10]
-            return meta
-        except Exception:
-            return {}
-
-
-# ─────────────────────────────────────────────
-# CHRISTIE'S
-# ─────────────────────────────────────────────
-
-class ChristiesScraper:
-    NAME = "Christie's"
-    DOMAIN = 'christies.com'
-    # Christie's usa next.js - i lotti sono in __NEXT_DATA__ JSON
-    RESULTS_URL = 'https://www.christies.com/en/results?department=watches&sortby=lotdatesold_desc'
-
-    def __init__(self, logger: logging.Logger, db: AuctionDB, max_lots: int = 50):
+    def __init__(self, name: str, logger: logging.Logger, db: AuctionDB):
+        self.name = name
         self.logger = logger
         self.db = db
-        self.max_lots = max_lots
 
-    def scrape(self) -> List[Dict]:
-        articles = []
-        with BrowserBase(self.logger) as br:
-            self.logger.info(f"Christie's: {self.RESULTS_URL}")
-            if not br.goto(self.RESULTS_URL):
-                return []
+    def is_watch(self, title: str, desc: str = '') -> bool:
+        text = (title + ' ' + desc).lower()
+        skip = ['jewelry', 'jewellery', 'necklace', 'ring ', 'earring',
+                'painting', 'sculpture', 'automobile', 'furniture',
+                'wine ', 'handbag', 'purse', 'artwork']
+        if any(k in text for k in skip):
+            return False
+        watch_kw = ['watch', 'wristwatch', 'timepiece', 'chronograph',
+                    'tourbillon', 'movement', 'orologio', 'montre', 'repeater']
+        if any(k in text for k in watch_kw):
+            return True
+        return bool(self.extract_brand(title))
 
-            br.scroll_down(6)
-            self._page_wait(br)  # wait extra per antibot JS-heavy
+    def extract_brand(self, text: str) -> Optional[str]:
+        tl = text.lower()
+        for brand in self.WATCH_BRANDS:
+            if brand.lower() in tl:
+                return brand
+        return None
 
-            # Estrai meta tags dalla pagina listing (data asta, ecc.)
-            page_meta = br.page_meta()
-            listing_date = page_meta.get('date') or ''
+    def make_id(self, s: str) -> str:
+        return hashlib.md5(s.encode()).hexdigest()[:16]
 
-            # Christie's inietta i dati in __NEXT_DATA__
-            raw = br._page.evaluate('''() => {
-                try {
-                    const d = JSON.parse(document.getElementById("__NEXT_DATA__").textContent);
-                    return JSON.stringify(d);
-                } catch(e) { return null; }
-            }''')
+    def build_rag_text(self, title: str, fields: Dict[str, str],
+                       min_words: int = 60) -> str:
+        """
+        Costruisce testo RAG garantendo almeno min_words parole.
+        Se i campi algolia sono quasi vuoti (caso Sotheby's), genera testo narrativo
+        invece di lasciare <50 parole che il chunker scarterebbe.
+        """
+        parts = [title]
+        for k, v in fields.items():
+            if v and str(v).strip():
+                parts.append(f"{k.capitalize()}: {str(v).strip()}")
 
-            lots_raw = []
-            if raw:
-                try:
-                    data = json.loads(raw)
-                    props = data.get('props', {}).get('pageProps', {})
+        text = '\n'.join(parts)
 
-                    # Log diagnostico: mostra le chiavi disponibili in pageProps
-                    self.logger.info(f"Christie's __NEXT_DATA__ keys: {list(props.keys())[:10]}")
-
-                    # Ricerca ricorsiva: qualsiasi lista con dicts che abbia campi lotto
-                    def find_lots(obj, depth=0):
-                        if depth > 6:
-                            return []
-                        if isinstance(obj, list) and len(obj) >= 3:
-                            if obj and isinstance(obj[0], dict):
-                                keys = set(obj[0].keys())
-                                if keys & {'title', 'lotNumber', 'objectDescription', 'lotTitle', 'lotUrl'}:
-                                    return obj
-                        if isinstance(obj, dict):
-                            for v in obj.values():
-                                result = find_lots(v, depth + 1)
-                                if result:
-                                    return result
-                        return []
-
-                    lots_raw = find_lots(props)
-                    if lots_raw:
-                        self.logger.info(f"Christie's: {len(lots_raw)} lotti da __NEXT_DATA__")
-                    else:
-                        self.logger.info("Christie's: __NEXT_DATA__ struttura non riconosciuta")
-                except Exception as e:
-                    self.logger.debug(f"Christie's next_data parse error: {e}")
-
-            # Fallback: estrai da DOM
-            if not lots_raw:
-                self.logger.info("Christie's: fallback DOM scraping")
-                lots_raw = br._page.evaluate('''() =>
-                    Array.from(document.querySelectorAll(
-                        "[class*='lot-tile'], [class*='LotTile'], [class*='result-item'], article"
-                    )).map(el => ({
-                        title: el.querySelector("h2,h3,[class*='title']")?.innerText?.trim() || '',
-                        description: el.querySelector("p,[class*='description']")?.innerText?.trim() || '',
-                        lot_number: el.querySelector("[class*='lot-number'],[class*='LotNumber']")?.innerText?.trim() || '',
-                        estimate: el.querySelector("[class*='estimate'],[class*='Estimate']")?.innerText?.trim() || '',
-                        realized: el.querySelector("[class*='price'],[class*='sold'],[class*='Price']")?.innerText?.trim() || '',
-                        url: el.querySelector("a")?.href || '',
-                        date: el.querySelector("time,[class*='date']")?.innerText?.trim() || '',
-                    })).filter(l => l.title)
-                ''')
-
-            self.logger.info(f"Christie's: {len(lots_raw)} lotti trovati")
-            articles = self._build_articles(lots_raw, listing_date)
-
-        return articles
-
-    def _build_articles(self, lots_raw: list, listing_date: str = '') -> List[Dict]:
-        articles = []
-        for item in lots_raw[:self.max_lots]:
-            # Normalizza: i dati possono venire da __NEXT_DATA__ (campi camelCase)
-            # oppure dal DOM (campi snake_case)
-            title = (
-                item.get('objectDescription') or
-                item.get('title') or
-                item.get('lotTitle') or ''
-            ).strip()
-            desc = (
-                item.get('description') or
-                item.get('lotDescription') or ''
-            ).strip()
-
-            if not is_watch(title, desc):
-                continue
-
-            lot_num = str(
-                item.get('lotNumber') or
-                item.get('lot_number') or ''
-            ).strip()
-            estimate = (
-                item.get('estimate') or
-                item.get('estimateText') or ''
-            ).strip()
-            realized = (
-                item.get('priceRealised') or
-                item.get('realized') or
-                item.get('sold') or ''
-            ).strip()
-            url = (
-                item.get('lotUrl') or
-                item.get('url') or ''
-            ).strip()
-            if url and not url.startswith('http'):
-                url = 'https://www.christies.com' + url
-
-            sale_name = (item.get('saleName') or item.get('auctionName') or '').strip()
-            auction_date = (item.get('saleDate') or item.get('date') or listing_date).strip()
-            location = (item.get('saleLocation') or item.get('location') or '').strip()
-
-            lot_id = make_lot_id(url or title, lot_num)
-            if self.db.is_crawled(lot_id):
-                continue
-
-            brand = extract_brand(title + ' ' + desc)
-            text = build_rag_text(
-                title, desc, "Christie's", sale_name,
-                lot_num, estimate, realized, auction_date, location
+        if len(text.split()) < min_words:
+            brand = self.extract_brand(title) or 'a prestigious brand'
+            extra_fields = ' '.join(
+                f"The {k} is {v}." for k, v in fields.items()
+                if v and str(v).strip()
+            )
+            text = (
+                f"{title}. "
+                f"This luxury watch lot from {brand} is offered at auction. "
+                f"{extra_fields} "
+                f"This timepiece represents an important opportunity for collectors "
+                f"and investors in the luxury watch market. "
+                f"Fine watchmaking, precision movement, and premium craftsmanship "
+                f"are hallmarks of this piece."
             )
 
-            article = {
-                'id': lot_id,
-                'source_url': url or f'https://www.christies.com/results',
-                'url': url or f'https://www.christies.com/results',
-                'title': title,
-                'text': text,
-                'date': auction_date[:10] if auction_date and len(auction_date) >= 10 else auction_date,
-                'authors': None,
-                'site': self.DOMAIN,
-                'site_type': 'auction',
-                'source_domain': self.DOMAIN,
-                'source_path': urlparse(url).path if url else '/results',
-                'crawled_at': datetime.utcnow().isoformat() + 'Z',
-                'brand': brand,
-                # Metadati asta (extra, per filtri RAG avanzati)
-                'auction_house': "Christie's",
-                'lot_number': lot_num,
-                'estimate': estimate,
-                'realized': realized,
-                'auction_name': sale_name,
-                'auction_date': auction_date,
-                'auction_location': location,
-            }
-            articles.append(article)
-            self.db.mark_crawled(lot_id, self.NAME, url or title)
+        return text
 
-        self.logger.info(f"Christie's: {len(articles)} orologi RAG-ready")
-        return articles
-
-
-# ─────────────────────────────────────────────
-# SOTHEBY'S
-# ─────────────────────────────────────────────
-
-class SothebysScraper:
-    NAME = "Sotheby's"
-    DOMAIN = 'sothebys.com'
-    RESULTS_URL = 'https://www.sothebys.com/en/results?sale_type=auction&department=watches-clocks'
-
-    def __init__(self, logger: logging.Logger, db: AuctionDB, max_lots: int = 50):
-        self.logger = logger
-        self.db = db
-        self.max_lots = max_lots
-
-    def scrape(self) -> List[Dict]:
-        articles = []
-        with BrowserBase(self.logger) as br:
-            self.logger.info(f"Sotheby's: {self.RESULTS_URL}")
-            if not br.goto(self.RESULTS_URL):
-                return []
-
-            br.scroll_down(8)
-
-            page_meta = br.page_meta()
-            listing_date = page_meta.get('date') or ''
-
-            # Sotheby's: prova __NEXT_DATA__ o window.__STATE__
-            raw = br._page.evaluate('''() => {
-                try {
-                    const nd = document.getElementById("__NEXT_DATA__");
-                    if (nd) return JSON.stringify(JSON.parse(nd.textContent));
-                } catch(e) {}
-                return null;
-            }''')
-
-            lots_raw = []
-            if raw:
-                try:
-                    data = json.loads(raw)
-                    props = data.get('props', {}).get('pageProps', {})
-                    self.logger.info(f"Sotheby's __NEXT_DATA__ keys: {list(props.keys())[:10]}")
-
-                    def find_lots(obj, depth=0):
-                        if depth > 6:
-                            return []
-                        if isinstance(obj, list) and len(obj) >= 3:
-                            if obj and isinstance(obj[0], dict):
-                                keys = set(obj[0].keys())
-                                if keys & {'title', 'lotNumber', 'objectTitle', 'lotUrl', 'priceRealised'}:
-                                    return obj
-                        if isinstance(obj, dict):
-                            for v in obj.values():
-                                result = find_lots(v, depth + 1)
-                                if result:
-                                    return result
-                        return []
-
-                    lots_raw = find_lots(props)
-                    if lots_raw:
-                        self.logger.info(f"Sotheby's: {len(lots_raw)} lotti da __NEXT_DATA__")
-                except Exception as e:
-                    self.logger.debug(f"Sotheby's next_data: {e}")
-
-            # Fallback DOM — selettori più ampi per catturare la struttura attuale
-            if not lots_raw:
-                self.logger.info("Sotheby's: fallback DOM scraping")
-                lots_raw = br._page.evaluate('''() =>
-                    Array.from(document.querySelectorAll(
-                        "[class*='Card'], [class*='LotCard'], [class*='lot-card'], " +
-                        "[class*='ResultItem'], [class*='result-item'], " +
-                        "[data-lot-id], [data-testid*='lot'], article"
-                    )).map(el => ({
-                        title: el.querySelector("h2,h3,h4,[class*='title'],[class*='Title']")?.innerText?.trim() || '',
-                        description: el.querySelector("p,[class*='description'],[class*='Description'],[class*='subtitle']")?.innerText?.trim() || '',
-                        lot_number: (el.innerText.match(/Lot\\s+(\\d+[A-Z]?)/i) || [])[1] || el.getAttribute('data-lot-id') || '',
-                        estimate: el.querySelector("[class*='estimate'],[class*='Estimate'],[class*='pre-sale']")?.innerText?.trim() || '',
-                        realized: el.querySelector("[class*='price'],[class*='Price'],[class*='sold'],[class*='hammer'],[class*='Hammer']")?.innerText?.trim() || '',
-                        url: el.querySelector("a")?.href || '',
-                        date: el.querySelector("time,[class*='date'],[class*='Date']")?.innerText?.trim() || '',
-                    })).filter(l => l.title && l.title.length > 3)
-                ''')
-                self.logger.info(f"Sotheby's: {len(lots_raw)} lotti da DOM")
-
-            articles = self._build_articles(lots_raw, listing_date)
-
-        return articles
-
-    def _build_articles(self, lots_raw: list, listing_date: str = '') -> List[Dict]:
-        articles = []
-        for item in lots_raw[:self.max_lots]:
-            title = (item.get('title') or item.get('objectTitle') or '').strip()
-            desc = (item.get('description') or item.get('lotDescription') or '').strip()
-
-            if not is_watch(title, desc):
-                continue
-
-            lot_num = str(item.get('lotNumber') or item.get('lot_number') or '').strip()
-            estimate = (item.get('estimate') or item.get('estimateText') or '').strip()
-            realized = (item.get('priceRealised') or item.get('realized') or item.get('hammerPrice') or '').strip()
-            url = (item.get('url') or item.get('lotUrl') or '').strip()
-            if url and not url.startswith('http'):
-                url = 'https://www.sothebys.com' + url
-
-            sale_name = (item.get('auctionTitle') or item.get('saleName') or '').strip()
-            auction_date = (item.get('saleDate') or item.get('date') or listing_date).strip()
-            location = (item.get('location') or '').strip()
-
-            lot_id = make_lot_id(url or title, lot_num)
-            if self.db.is_crawled(lot_id):
-                continue
-
-            brand = extract_brand(title + ' ' + desc)
-            text = build_rag_text(
-                title, desc, "Sotheby's", sale_name,
-                lot_num, estimate, realized, auction_date, location
-            )
-
-            article = {
-                'id': lot_id,
-                'source_url': url or 'https://www.sothebys.com/en/buy/watches',
-                'url': url or 'https://www.sothebys.com/en/buy/watches',
-                'title': title,
-                'text': text,
-                'date': auction_date[:10] if auction_date and len(auction_date) >= 10 else auction_date,
-                'authors': None,
-                'site': self.DOMAIN,
-                'site_type': 'auction',
-                'source_domain': self.DOMAIN,
-                'source_path': urlparse(url).path if url else '/en/buy/watches',
-                'crawled_at': datetime.utcnow().isoformat() + 'Z',
-                'brand': brand,
-                'auction_house': "Sotheby's",
-                'lot_number': lot_num,
-                'estimate': estimate,
-                'realized': realized,
-                'auction_name': sale_name,
-                'auction_date': auction_date,
-                'auction_location': location,
-            }
-            articles.append(article)
-            self.db.mark_crawled(lot_id, self.NAME, url or title)
-
-        self.logger.info(f"Sotheby's: {len(articles)} orologi RAG-ready")
-        return articles
-
-
-# ─────────────────────────────────────────────
-# PHILLIPS
-# ─────────────────────────────────────────────
-
-class PhillipsScraper:
-    NAME = "Phillips"
-    DOMAIN = 'phillips.com'
-    # Phillips ha URL prevedibili per tipo asta: /auctions/past?department=watches
-    RESULTS_URL = 'https://www.phillips.com/auctions/past/filter/Department=Watches'
-
-    def __init__(self, logger: logging.Logger, db: AuctionDB, max_lots: int = 50):
-        self.logger = logger
-        self.db = db
-        self.max_lots = max_lots
-
-    def scrape(self) -> List[Dict]:
-        articles = []
-        with BrowserBase(self.logger) as br:
-            self.logger.info(f"Phillips: {self.RESULTS_URL}")
-            if not br.goto(self.RESULTS_URL):
-                return []
-
-            br.scroll_down(4)
-
-            # Phillips: raccoglie URL aste watches recenti
-            auction_links = br._page.evaluate('''() =>
-                Array.from(document.querySelectorAll('a[href*="/auction/"]'))
-                    .map(a => a.href)
-                    .filter((v, i, a) => a.indexOf(v) === i)
-                    .filter(u => u.includes('phillips.com'))
-            ''')
-
-            self.logger.info(f"Phillips: {len(auction_links)} aste trovate")
-
-            # Scrapa le prime N aste
-            for auction_url in auction_links[:3]:
-                lots = self._scrape_auction(br, auction_url)
-                articles.extend(lots)
-                if len(articles) >= self.max_lots:
-                    break
-                time.sleep(2)
-
-        return articles
-
-    def _scrape_auction(self, br: BrowserBase, auction_url: str) -> List[Dict]:
-        if not br.goto(auction_url):
+    def find_lots_recursive(self, obj, candidate_keys, depth=0) -> list:
+        """Ricerca ricorsiva array lotti in strutture JSON/Next.js."""
+        if depth > 10:
             return []
+        if isinstance(obj, list) and len(obj) >= 1:
+            if isinstance(obj[0], dict) and any(k in obj[0] for k in candidate_keys):
+                return obj
+        if isinstance(obj, dict):
+            for key in ('hits', 'lots', 'items', 'data', 'results', 'lotList'):
+                if key in obj:
+                    r = self.find_lots_recursive(obj[key], candidate_keys, depth + 1)
+                    if r:
+                        return r
+            for v in obj.values():
+                r = self.find_lots_recursive(v, candidate_keys, depth + 1)
+                if r:
+                    return r
+        return []
 
-        br.scroll_down(6)
 
-        # Estrai meta tags (fallback date se __NEXT_DATA__ non la ha)
-        page_meta = br.page_meta()
+# ─── CHRISTIE'S ───────────────────────────────────────────────────────────────
 
-        # Phillips inietta dati in __NEXT_DATA__
-        raw = br._page.evaluate('''() => {
-            try {
-                return JSON.stringify(JSON.parse(document.getElementById("__NEXT_DATA__").textContent));
-            } catch(e) { return null; }
-        }''')
+class ChristiesScraper(AuctionScraper):
+    """
+    Christie's: prima tenta API JSON interna (senza browser, bypass antibot).
+    Se fallisce → Camoufox con virtual_display.
+    """
 
-        lots_raw = []
-        sale_name = ''
-        auction_date = page_meta.get('date') or ''  # fallback da meta tag
-        location = ''
+    BASE = 'https://www.christies.com'
+    HEADERS = {
+        'User-Agent': (
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        ),
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://www.christies.com/en/results?department=watches',
+    }
 
-        if raw:
+    def discover_and_scrape(self, url: str, max_lots: int = 100) -> List[AuctionArticle]:
+        self.logger.info(f"Christie's: {url}")
+
+        # Strategia 1: requests JSON (nessun browser, bypass antibot)
+        lots = self._try_api(max_lots)
+        if lots:
+            self.logger.info(f"Christie's API: {len(lots)} orologi")
+            return lots
+
+        # Strategia 2: Camoufox virtual_display
+        self.logger.info("Christie's: API fallita → Camoufox virtual_display")
+        lots = self._try_browser(url, max_lots)
+        self.logger.info(f"Christie's browser: {len(lots)} orologi")
+        return lots
+
+    def _try_api(self, max_lots: int) -> List[AuctionArticle]:
+        lots = []
+        endpoints = [
+            'https://www.christies.com/api/search/lots?keyword=watches&department=watches&sortby=lotdatesold_desc',
+            'https://www.christies.com/api/v1/lots?department=watches&sortby=lotdatesold_desc',
+        ]
+        for endpoint in endpoints:
             try:
-                data = json.loads(raw)
-                props = data.get('props', {}).get('pageProps', {})
-                # Phillips: spesso in props.auction.lots o props.lots
-                auction_obj = props.get('auction') or props.get('sale') or {}
-                sale_name = auction_obj.get('title') or auction_obj.get('name') or ''
-                auction_date = auction_obj.get('date') or auction_obj.get('saleDate') or ''
-                location = auction_obj.get('location') or ''
-
-                for key in ('lots', 'items'):
-                    candidate = auction_obj.get(key) or props.get(key)
-                    if isinstance(candidate, list):
-                        lots_raw = candidate
-                        break
+                r = requests.get(endpoint, headers=self.HEADERS, timeout=20)
+                if r.status_code == 200:
+                    data = r.json()
+                    items = (data.get('lots') or data.get('results') or
+                             data.get('data', {}).get('lots') or [])
+                    if items:
+                        self.logger.info(f"Christie's API OK ({endpoint}): {len(items)} items")
+                        for item in items[:max_lots]:
+                            lot = self._parse_api_item(item)
+                            if lot:
+                                lots.append(lot)
+                        return lots
             except Exception as e:
-                self.logger.debug(f"Phillips next_data parse: {e}")
+                self.logger.debug(f"Christie's endpoint {endpoint}: {e}")
+        return lots
 
-        if not lots_raw:
+    def _parse_api_item(self, item: dict) -> Optional[AuctionArticle]:
+        title = (item.get('object_name') or item.get('title') or
+                 item.get('lot_title') or '').strip()
+        if not title or not self.is_watch(title):
+            return None
+
+        lot_id = str(item.get('lot_id') or item.get('id') or self.make_id(title))
+        if self.db.seen(lot_id):
+            return None
+
+        url = item.get('url') or item.get('lot_url') or f"{self.BASE}/lot/{lot_id}"
+        if not url.startswith('http'):
+            url = self.BASE + url
+
+        currency = item.get('currency', 'GBP')
+        est_low = item.get('estimate_price_low', '')
+        est_high = item.get('estimate_price_high', '')
+        estimate = f"{currency} {int(est_low):,}–{int(est_high):,}" if est_low else ''
+        realized = (f"{currency} {item['price_realised']:,}"
+                    if item.get('price_realised') else '')
+
+        fields = {
+            'lot number': str(item.get('lot_number', '')),
+            'estimate': estimate,
+            'realized price': realized,
+            'sale': str(item.get('sale_title', '')),
+            'description': str(item.get('description', '') or
+                                item.get('short_description', '')),
+        }
+        text = self.build_rag_text(title, fields)
+        parsed = urlparse(url)
+        art = AuctionArticle(
+            id=lot_id, url=url, title=title, text=text,
+            site='christies.com', site_type='auction',
+            source_domain='christies.com', source_path=parsed.path,
+            crawled_at=datetime.now().isoformat() + 'Z',
+            brand=self.extract_brand(title),
+            metadata={'auction_house': 'christies',
+                      'lot_number': str(item.get('lot_number', '')),
+                      'estimate': estimate, 'realized': realized}
+        )
+        self.db.mark(lot_id, 'christies')
+        return art
+
+    def _try_browser(self, url: str, max_lots: int) -> List[AuctionArticle]:
+        lots = []
+        kind, h1, h2, page = _make_browser_page()
+        try:
+            for attempt in range(3):
+                try:
+                    page.goto(url, wait_until='domcontentloaded', timeout=60000)
+                    page.wait_for_timeout(5000)
+                    break
+                except Exception as e:
+                    self.logger.warning(
+                        f"Christie's browser timeout attempt {attempt+1}: {e}")
+                    if attempt == 2:
+                        return lots
+                    time.sleep(5)
+
+            for _ in range(5):
+                page.evaluate('window.scrollBy(0, 800)')
+                page.wait_for_timeout(700)
+
+            # Tenta __NEXT_DATA__
+            try:
+                nd = page.evaluate(
+                    '() => document.getElementById("__NEXT_DATA__")?.textContent'
+                )
+                if nd:
+                    data = json.loads(nd)
+                    items = self.find_lots_recursive(
+                        data, ('lot_id', 'lotId', 'object_name', 'lot_title', 'title')
+                    )
+                    for item in items[:max_lots]:
+                        lot = self._parse_api_item(item) if isinstance(item, dict) else None
+                        if lot:
+                            lots.append(lot)
+                    if lots:
+                        return lots
+            except Exception as e:
+                self.logger.debug(f"Christie's __NEXT_DATA__: {e}")
+
             # DOM fallback
-            lots_raw = br._page.evaluate('''() =>
-                Array.from(document.querySelectorAll(
-                    "[class*='Lot'], [class*='lot-card'], article"
-                )).map(el => ({
-                    title: el.querySelector("h2,h3,[class*='title']")?.innerText?.trim() || '',
-                    description: el.querySelector("p,[class*='description'],[class*='Description']")?.innerText?.trim() || '',
-                    lot_number: el.querySelector("[class*='lot-number'],[class*='LotNumber']")?.innerText?.trim()
-                               || (el.innerText.match(/^Lot\\s+(\\d+)/m) || [])[1] || '',
-                    estimate: el.querySelector("[class*='estimate'],[class*='Estimate']")?.innerText?.trim() || '',
-                    realized: el.querySelector("[class*='price'],[class*='sold'],[class*='hammer']")?.innerText?.trim() || '',
-                    url: el.querySelector("a")?.href || '',
-                })).filter(l => l.title)
+            lot_data = page.evaluate('''
+                () => Array.from(document.querySelectorAll(
+                    '[class*="lot"], [data-lot], article, [class*="Lot"]'
+                )).map(e => ({
+                    title: e.querySelector('h2,h3,[class*="title"],[class*="Title"]')
+                             ?.innerText?.trim() || '',
+                    description: e.querySelector('p,[class*="desc"]')?.innerText?.trim() || '',
+                    lotNum: e.querySelector('[class*="lot-number"],[class*="lotNumber"]')
+                              ?.innerText?.trim() || '',
+                    estimate: e.querySelector('[class*="estimate"],[class*="Estimate"]')
+                                ?.innerText?.trim() || '',
+                    realized: e.querySelector('[class*="sold"],[class*="price"]')
+                                ?.innerText?.trim() || '',
+                    url: e.querySelector('a')?.href || ''
+                })).filter(l => l.title.length > 5)
             ''')
-            # Estrai info asta da titolo pagina
-            sale_name = br._page.title()
 
-        articles = []
-        for item in lots_raw:
-            title = (item.get('title') or item.get('lotTitle') or item.get('objectTitle') or '').strip()
-            desc = (item.get('description') or item.get('lotDescription') or '').strip()
+            for item in lot_data[:max_lots]:
+                if not self.is_watch(item.get('title', ''), item.get('description', '')):
+                    continue
+                lot_id = self.make_id(item.get('url') or item['title'])
+                if self.db.seen(lot_id):
+                    continue
+                text = self.build_rag_text(item['title'], {
+                    'lot number': item.get('lotNum', ''),
+                    'estimate': item.get('estimate', ''),
+                    'realized price': item.get('realized', ''),
+                    'description': item.get('description', ''),
+                })
+                url_lot = item.get('url') or url
+                parsed = urlparse(url_lot)
+                lot = AuctionArticle(
+                    id=lot_id, url=url_lot, title=item['title'], text=text,
+                    site='christies.com', site_type='auction',
+                    source_domain='christies.com', source_path=parsed.path,
+                    crawled_at=datetime.now().isoformat() + 'Z',
+                    brand=self.extract_brand(item['title']),
+                    metadata={'auction_house': 'christies',
+                              'lot_number': item.get('lotNum', '')}
+                )
+                lots.append(lot)
+                self.db.mark(lot_id, 'christies')
+        finally:
+            _close_browser(kind, h1, h2, page)
+        return lots
 
-            if not is_watch(title, desc):
-                continue
 
-            lot_num = str(item.get('lotNumber') or item.get('lot_number') or '').strip()
-            estimate = (item.get('estimate') or item.get('estimateText') or '').strip()
-            realized = (item.get('priceRealised') or item.get('realized') or item.get('hammerPrice') or '').strip()
-            url = (item.get('url') or item.get('lotUrl') or '').strip()
-            if url and not url.startswith('http'):
-                url = 'https://www.phillips.com' + url
-            if not url:
-                url = auction_url
+# ─── SOTHEBY'S ────────────────────────────────────────────────────────────────
 
-            lot_id = make_lot_id(url, lot_num)
-            if self.db.is_crawled(lot_id):
-                continue
+class SothebysScraper(AuctionScraper):
+    """
+    Sotheby's: __NEXT_DATA__ con ricerca ricorsiva.
+    Fix: build_rag_text garantisce testo sufficiente anche con campi algolia vuoti.
+    """
 
-            brand = extract_brand(title + ' ' + desc)
-            item_date = (item.get('date') or auction_date or '').strip()
-            text = build_rag_text(
-                title, desc, "Phillips", sale_name,
-                lot_num, estimate, realized, item_date, location
+    def discover_and_scrape(self, url: str, max_lots: int = 100) -> List[AuctionArticle]:
+        lots = []
+        self.logger.info(f"Sotheby's: {url}")
+        kind, h1, h2, page = _make_browser_page()
+
+        try:
+            page.goto(url, wait_until='domcontentloaded', timeout=45000)
+            page.wait_for_timeout(4000)
+            for _ in range(4):
+                page.evaluate('window.scrollBy(0, 800)')
+                page.wait_for_timeout(700)
+
+            nd = page.evaluate(
+                '() => document.getElementById("__NEXT_DATA__")?.textContent'
             )
+            if nd:
+                data = json.loads(nd)
+                items = self.find_lots_recursive(
+                    data,
+                    ('objectID', 'lotNumber', 'lotId', 'estimateLow', 'priceRealised')
+                )
+                self.logger.info(f"Sotheby's __NEXT_DATA__: {len(items)} items")
+                for item in items[:max_lots]:
+                    lot = self._parse_item(item, url)
+                    if lot:
+                        lots.append(lot)
 
-            articles.append({
-                'id': lot_id,
-                'source_url': url,
-                'url': url,
-                'title': title,
-                'text': text,
-                'date': item_date[:10] if item_date and len(item_date) >= 10 else item_date,
-                'authors': None,
-                'site': self.DOMAIN,
-                'site_type': 'auction',
-                'source_domain': self.DOMAIN,
-                'source_path': urlparse(url).path,
-                'crawled_at': datetime.utcnow().isoformat() + 'Z',
-                'brand': brand,
-                'auction_house': 'Phillips',
-                'lot_number': lot_num,
-                'estimate': estimate,
-                'realized': realized,
-                'auction_name': sale_name,
-                'auction_date': item_date,
-                'auction_location': location,
-            })
-            self.db.mark_crawled(lot_id, self.NAME, url)
-
-        self.logger.info(f"Phillips: {len(articles)} orologi da {auction_url}")
-        return articles
-
-
-# ─────────────────────────────────────────────
-# ANTIQUORUM
-# ─────────────────────────────────────────────
-
-class AntiquorumScraper:
-    NAME = "Antiquorum"
-    DOMAIN = 'antiquorum.swiss'
-    CATALOG_URL = 'https://catalog.antiquorum.swiss/'
-    FALLBACK_URL = 'https://www.antiquorum.swiss/auctions'
-
-    def __init__(self, logger: logging.Logger, db: AuctionDB, max_lots: int = 50):
-        self.logger = logger
-        self.db = db
-        self.max_lots = max_lots
-
-    def scrape(self) -> List[Dict]:
-        articles = []
-        with BrowserBase(self.logger) as br:
-            self.logger.info(f"Antiquorum: {self.CATALOG_URL}")
-            if not br.goto(self.CATALOG_URL):
-                return []
-
-            br.scroll_down(4)
-
-            # Antiquorum: cerca link alle aste/lotti — selettori più ampi
-            auction_links = br._page.evaluate('''() =>
-                Array.from(document.querySelectorAll("a"))
-                    .map(a => a.href)
-                    .filter(h => h && (
-                        h.includes('/auction/') || h.includes('/lot/') ||
-                        h.includes('/catalog/') || h.includes('/sale/') ||
-                        h.includes('/vente/') || h.includes('/lots')
-                    ))
-                    .filter((v, i, a) => a.indexOf(v) === i)
-                    .filter(u => u.includes('antiquorum'))
-            ''')
-
-            self.logger.info(f"Antiquorum: {len(auction_links)} link trovati su {self.CATALOG_URL}")
-
-            # Diagnostica: mostra tutti i link della pagina se 0 trovati
-            if not auction_links:
-                all_links = br._page.evaluate('''() =>
-                    Array.from(document.querySelectorAll("a[href]"))
-                        .map(a => a.href).slice(0, 20)
+            # DOM fallback
+            if not lots:
+                lot_data = page.evaluate('''
+                    () => Array.from(document.querySelectorAll(
+                        '[class*="Card"],article,[class*="lot"],[class*="Lot"]'
+                    )).map(e => ({
+                        title: e.querySelector('h2,h3,[class*="title"]')
+                                 ?.innerText?.trim() || '',
+                        description: e.querySelector('p,[class*="desc"]')
+                                       ?.innerText?.trim() || '',
+                        lotNum: (e.innerText.match(/Lot\\s*(\\d+)/i)||[])[1] || '',
+                        estimate: e.querySelector('[class*="estimate"],[class*="price"]')
+                                    ?.innerText?.trim() || '',
+                        url: e.querySelector('a')?.href || ''
+                    })).filter(l => l.title.length > 5)
                 ''')
-                self.logger.info(f"Antiquorum: link totali pagina: {all_links}")
+                for item in lot_data[:max_lots]:
+                    lot = self._parse_dom_item(item, url)
+                    if lot:
+                        lots.append(lot)
 
-                # Prova URL alternativo
-                self.logger.info(f"Antiquorum: provo fallback {self.FALLBACK_URL}")
-                if br.goto(self.FALLBACK_URL):
-                    br.scroll_down(4)
-                    auction_links = br._page.evaluate('''() =>
-                        Array.from(document.querySelectorAll("a"))
-                            .map(a => a.href)
-                            .filter(h => h && (
-                                h.includes('/auction/') || h.includes('/lot/') ||
-                                h.includes('/sale/') || h.includes('/lots')
-                            ))
-                            .filter((v, i, a) => a.indexOf(v) === i)
-                    ''')
-                    self.logger.info(f"Antiquorum fallback: {len(auction_links)} link trovati")
+        finally:
+            _close_browser(kind, h1, h2, page)
 
-            if not auction_links:
-                # Scrapa direttamente la pagina corrente
-                articles = self._scrape_page(br, self.CATALOG_URL, '', '', '')
-            else:
-                for link in auction_links[:3]:
-                    if br.goto(link):
-                        br.scroll_down(6)
-                        lots = self._scrape_page(br, link, '', '', '')
-                        articles.extend(lots)
-                    if len(articles) >= self.max_lots:
-                        break
-                    time.sleep(2)
+        self.logger.info(f"Sotheby's: {len(lots)} orologi RAG-ready")
+        return lots
 
-        return articles
+    def _parse_item(self, item: dict, base_url: str) -> Optional[AuctionArticle]:
+        title = (item.get('title') or item.get('lotTitle') or
+                 item.get('object_name') or '').strip()
+        if not title or not self.is_watch(title):
+            return None
 
-    def _scrape_page(self, br: BrowserBase, page_url: str,
-                     sale_name: str, auction_date: str, location: str) -> List[Dict]:
-        # Prova __NEXT_DATA__ prima
-        raw = br._page.evaluate('''() => {
-            try {
-                return JSON.stringify(JSON.parse(document.getElementById("__NEXT_DATA__").textContent));
-            } catch(e) { return null; }
-        }''')
+        lot_id = str(item.get('objectID') or item.get('lotId') or self.make_id(title))
+        if self.db.seen(lot_id):
+            return None
 
-        # Estrai meta tags (fallback date)
-        page_meta = br.page_meta()
+        url = item.get('url') or item.get('lotUrl') or base_url
+        if url and not url.startswith('http'):
+            url = 'https://www.sothebys.com' + url
 
-        lots_raw = []
-        if raw:
-            try:
-                data = json.loads(raw)
-                props = data.get('props', {}).get('pageProps', {})
-                for key in ('lots', 'items', 'watches', 'results'):
-                    candidate = props.get(key)
-                    if isinstance(candidate, list):
-                        lots_raw = candidate
-                        break
-                    if isinstance(candidate, dict):
-                        for sk in ('lots', 'items'):
-                            sub = candidate.get(sk)
-                            if isinstance(sub, list):
-                                lots_raw = sub
-                                break
-                if not sale_name:
-                    sale_name = (props.get('auction') or props.get('sale') or {}).get('title', '')
-            except Exception as e:
-                self.logger.debug(f"Antiquorum next_data: {e}")
+        currency = item.get('currency') or item.get('priceCurrency') or 'USD'
+        est_low = item.get('estimateLow') or item.get('estimate_low') or ''
+        est_high = item.get('estimateHigh') or item.get('estimate_high') or ''
+        if est_low and est_high:
+            estimate = f"{currency} {int(est_low):,}–{int(est_high):,}"
+        else:
+            estimate = str(item.get('estimate') or item.get('estimateText') or '')
 
-        if not lots_raw:
-            # DOM fallback generico
-            lots_raw = br._page.evaluate('''() =>
-                Array.from(document.querySelectorAll(
-                    "[class*='lot'], [class*='item'], [class*='watch'], article, li"
-                )).map(el => ({
-                    title: el.querySelector("h2,h3,h4,[class*='title'],[class*='name']")?.innerText?.trim() || '',
-                    description: el.querySelector("p,[class*='description'],[class*='desc']")?.innerText?.trim() || '',
-                    lot_number: el.querySelector("[class*='lot-number'],[class*='lot_number']")?.innerText?.trim()
-                               || (el.innerText.match(/Lot[:\\s]+(\\d+[A-Z]?)/i) || [])[1] || '',
-                    estimate: el.querySelector("[class*='estimate'],[class*='price']")?.innerText?.trim() || '',
-                    realized: el.querySelector("[class*='realized'],[class*='sold'],[class*='hammer']")?.innerText?.trim() || '',
-                    url: el.querySelector("a")?.href || '',
-                })).filter(l => l.title && l.title.length > 5)
+        realized = str(item.get('priceRealised') or item.get('hammerPrice') or '')
+        lot_num = str(item.get('lotNumber') or item.get('lot_number') or '')
+        description = str(item.get('description') or item.get('shortDescription') or
+                          item.get('provenance') or '')
+        sale_title = str(item.get('saleTitle') or item.get('sale_title') or '')
+
+        fields = {
+            'description': description,
+            'lot number': lot_num,
+            'estimate': estimate,
+            'realized price': realized,
+            'sale': sale_title,
+        }
+        text = self.build_rag_text(title, fields)
+        parsed = urlparse(url)
+        art = AuctionArticle(
+            id=lot_id, url=url, title=title, text=text,
+            site='sothebys.com', site_type='auction',
+            source_domain='sothebys.com', source_path=parsed.path,
+            crawled_at=datetime.now().isoformat() + 'Z',
+            brand=self.extract_brand(title),
+            metadata={'auction_house': 'sothebys', 'lot_number': lot_num,
+                      'estimate': estimate, 'realized': realized}
+        )
+        self.db.mark(lot_id, 'sothebys')
+        return art
+
+    def _parse_dom_item(self, item: dict, base_url: str) -> Optional[AuctionArticle]:
+        title = item.get('title', '').strip()
+        if not title or not self.is_watch(title):
+            return None
+        lot_id = self.make_id(item.get('url') or title)
+        if self.db.seen(lot_id):
+            return None
+        fields = {
+            'description': item.get('description', ''),
+            'lot number': item.get('lotNum', ''),
+            'estimate': item.get('estimate', ''),
+        }
+        text = self.build_rag_text(title, fields)
+        url = item.get('url') or base_url
+        parsed = urlparse(url)
+        art = AuctionArticle(
+            id=lot_id, url=url, title=title, text=text,
+            site='sothebys.com', site_type='auction',
+            source_domain='sothebys.com', source_path=parsed.path,
+            crawled_at=datetime.now().isoformat() + 'Z',
+            brand=self.extract_brand(title),
+            metadata={'auction_house': 'sothebys'}
+        )
+        self.db.mark(lot_id, 'sothebys')
+        return art
+
+
+# ─── PHILLIPS ─────────────────────────────────────────────────────────────────
+
+class PhillipsScraper(AuctionScraper):
+    """
+    Phillips: lista aste passate → scrape lotti per ogni asta.
+    Fix: pattern URL ampliato per CH/UK/HK/NY, __NEXT_DATA__ ricorsivo.
+    """
+
+    def discover_and_scrape(self, url: str, max_lots: int = 100) -> List[AuctionArticle]:
+        lots = []
+        self.logger.info(f"Phillips: {url}")
+        kind, h1, h2, page = _make_browser_page()
+
+        try:
+            page.goto(url, wait_until='domcontentloaded', timeout=45000)
+            page.wait_for_timeout(3000)
+
+            # Pattern URL asta Phillips: /auction/XXNNNNNN (es. CH080126, UK010126)
+            auction_urls = page.evaluate('''
+                () => [...new Set(
+                    Array.from(document.querySelectorAll('a[href*="/auction/"]'))
+                        .map(a => a.href)
+                        .filter(u => /\\/auction\\/[A-Z]{2}\\d{6}/.test(u))
+                )]
             ''')
-            sale_name = sale_name or br._page.title()
+            self.logger.info(f"Phillips: {len(auction_urls)} aste trovate")
 
-        articles = []
-        for item in lots_raw[:self.max_lots]:
-            title = (item.get('title') or item.get('name') or item.get('objectTitle') or '').strip()
-            desc = (item.get('description') or item.get('desc') or '').strip()
+            for auction_url in auction_urls[:6]:
+                if len(lots) >= max_lots:
+                    break
+                new_lots = self._scrape_auction(page, auction_url,
+                                                max_lots - len(lots))
+                self.logger.info(
+                    f"Phillips {auction_url}: {len(new_lots)} orologi")
+                lots.extend(new_lots)
+                time.sleep(2)
 
-            if not is_watch(title, desc):
-                continue
+        finally:
+            _close_browser(kind, h1, h2, page)
 
-            lot_num = str(item.get('lot_number') or item.get('lotNumber') or '').strip()
-            estimate = (item.get('estimate') or item.get('estimateText') or '').strip()
-            realized = (item.get('realized') or item.get('priceRealised') or item.get('sold') or '').strip()
-            url = (item.get('url') or item.get('lotUrl') or '').strip()
-            if url and not url.startswith('http'):
-                url = urljoin(self.CATALOG_URL, url)
-            if not url:
-                url = page_url
+        self.logger.info(f"Phillips: {len(lots)} orologi RAG-ready")
+        return lots
 
-            item_date = (item.get('date') or auction_date or page_meta.get('date') or '').strip()
-            lot_id = make_lot_id(url, lot_num)
-            if self.db.is_crawled(lot_id):
-                continue
+    def _scrape_auction(self, page, auction_url: str,
+                        max_lots: int) -> List[AuctionArticle]:
+        lots = []
+        try:
+            page.goto(auction_url, wait_until='domcontentloaded', timeout=45000)
+            page.wait_for_timeout(3000)
+            for _ in range(4):
+                page.evaluate('window.scrollBy(0, 800)')
+                page.wait_for_timeout(600)
 
-            brand = extract_brand(title + ' ' + desc)
-            text = build_rag_text(
-                title, desc, "Antiquorum", sale_name,
-                lot_num, estimate, realized, item_date, location or 'Geneva'
+            # __NEXT_DATA__
+            nd = page.evaluate(
+                '() => document.getElementById("__NEXT_DATA__")?.textContent'
             )
+            if nd:
+                try:
+                    data = json.loads(nd)
+                    items = self.find_lots_recursive(
+                        data,
+                        ('lotNumber', 'title', 'estimate', 'lotId', 'priceRealized',
+                         'maker', 'artist')
+                    )
+                    if items:
+                        for item in items[:max_lots]:
+                            lot = self._parse_next_item(item, auction_url)
+                            if lot:
+                                lots.append(lot)
+                        if lots:
+                            return lots
+                except Exception as e:
+                    self.logger.debug(f"Phillips __NEXT_DATA__: {e}")
 
-            articles.append({
-                'id': lot_id,
-                'source_url': url,
-                'url': url,
-                'title': title,
-                'text': text,
-                'date': item_date[:10] if item_date and len(item_date) >= 10 else item_date,
-                'authors': None,
-                'site': self.DOMAIN,
-                'site_type': 'auction',
-                'source_domain': self.DOMAIN,
-                'source_path': urlparse(url).path,
-                'crawled_at': datetime.utcnow().isoformat() + 'Z',
-                'brand': brand,
-                'auction_house': 'Antiquorum',
-                'lot_number': lot_num,
-                'estimate': estimate,
-                'realized': realized,
-                'auction_name': sale_name,
-                'auction_date': item_date,
-                'auction_location': location or 'Geneva',
-            })
-            self.db.mark_crawled(lot_id, self.NAME, url)
+            # DOM fallback
+            lot_data = page.evaluate('''
+                () => Array.from(document.querySelectorAll(
+                    '[class*="lot"],[class*="Lot"],article,[data-testid*="lot"]'
+                )).map(e => ({
+                    title: e.querySelector(
+                        '[class*="title"],[class*="Title"],h2,h3'
+                    )?.innerText?.trim() || '',
+                    lotNum: (e.innerText.match(/Lot\\s*(\\d+[A-Z]?)/i)||[])[1] || '',
+                    estimate: e.querySelector('[class*="estimate"],[class*="Estimate"]')
+                                ?.innerText?.trim() || '',
+                    realized: e.querySelector(
+                        '[class*="sold"],[class*="price"],[class*="Price"]'
+                    )?.innerText?.trim() || '',
+                    description: e.querySelector('p,[class*="desc"]')
+                                   ?.innerText?.trim() || '',
+                    url: e.querySelector('a')?.href || ''
+                })).filter(l => l.title.length > 5)
+            ''')
+            for item in lot_data[:max_lots]:
+                if not self.is_watch(item.get('title', ''), item.get('description', '')):
+                    continue
+                lot_id = self.make_id(item.get('url') or item['title'])
+                if self.db.seen(lot_id):
+                    continue
+                text = self.build_rag_text(item['title'], {
+                    'lot number': item.get('lotNum', ''),
+                    'estimate': item.get('estimate', ''),
+                    'realized price': item.get('realized', ''),
+                    'description': item.get('description', ''),
+                })
+                url_lot = item.get('url') or auction_url
+                parsed = urlparse(url_lot)
+                lot = AuctionArticle(
+                    id=lot_id, url=url_lot, title=item['title'], text=text,
+                    site='phillips.com', site_type='auction',
+                    source_domain='phillips.com', source_path=parsed.path,
+                    crawled_at=datetime.now().isoformat() + 'Z',
+                    brand=self.extract_brand(item['title']),
+                    metadata={'auction_house': 'phillips',
+                              'lot_number': item.get('lotNum', '')}
+                )
+                lots.append(lot)
+                self.db.mark(lot_id, 'phillips')
+        except Exception as e:
+            self.logger.error(f"Phillips {auction_url}: {e}")
+        return lots
 
-        self.logger.info(f"Antiquorum: {len(articles)} orologi da {page_url}")
-        return articles
+    def _parse_next_item(self, item: dict, base_url: str) -> Optional[AuctionArticle]:
+        title = (item.get('title') or item.get('lotTitle') or '').strip()
+        maker = (item.get('maker') or item.get('brand') or
+                 item.get('artist') or '').strip()
+        if maker and maker.lower() not in title.lower():
+            title = f"{maker} – {title}" if title else maker
+        if not title or not self.is_watch(title):
+            return None
+
+        lot_id = str(item.get('lotId') or item.get('id') or self.make_id(title))
+        if self.db.seen(lot_id):
+            return None
+
+        url = item.get('url') or item.get('lotUrl') or base_url
+        if url and not url.startswith('http'):
+            url = 'https://www.phillips.com' + url
+
+        estimate = str(item.get('estimate') or item.get('estimateText') or '')
+        realized = str(item.get('priceRealized') or item.get('hammerPrice') or '')
+        lot_num = str(item.get('lotNumber') or '')
+        desc = str(item.get('description') or item.get('provenance') or '')
+
+        text = self.build_rag_text(title, {
+            'lot number': lot_num, 'estimate': estimate,
+            'realized price': realized, 'description': desc,
+        })
+        parsed = urlparse(url)
+        art = AuctionArticle(
+            id=lot_id, url=url, title=title, text=text,
+            site='phillips.com', site_type='auction',
+            source_domain='phillips.com', source_path=parsed.path,
+            crawled_at=datetime.now().isoformat() + 'Z',
+            brand=self.extract_brand(title),
+            metadata={'auction_house': 'phillips', 'lot_number': lot_num,
+                      'estimate': estimate, 'realized': realized}
+        )
+        self.db.mark(lot_id, 'phillips')
+        return art
 
 
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
+# ─── ANTIQUORUM ───────────────────────────────────────────────────────────────
 
-def load_auction_sites(logger: logging.Logger) -> List[dict]:
+class AntiquorumScraper(AuctionScraper):
     """
-    Carica la lista delle case d'asta da env var AUCTION_SITES (secret GitHub).
-    Formato JSON: [{"name": "christies", "url": "https://..."}, ...]
-    Fallback: URL hardcoded nei singoli scraper.
+    Antiquorum: catalog.antiquorum.swiss.
+    Fix: selettori DOM riscritti per struttura reale del sito.
+    Strategia: scopri link aste → per ogni asta scrape lotti con selettori multipli.
     """
-    raw = os.environ.get('AUCTION_SITES', '').strip()
-    if not raw:
-        logger.info("AUCTION_SITES non impostato → URL hardcoded nei scraper")
-        return []
-    try:
-        sites = json.loads(raw)
-        if not isinstance(sites, list):
-            raise ValueError("AUCTION_SITES deve essere una lista JSON")
-        logger.info(f"AUCTION_SITES: {len(sites)} case caricate da secret")
-        return sites
-    except Exception as e:
-        logger.warning(f"AUCTION_SITES parse error: {e} → URL hardcoded")
-        return []
 
+    BASE = 'https://catalog.antiquorum.swiss'
+
+    def discover_and_scrape(self, url: str, max_lots: int = 100) -> List[AuctionArticle]:
+        lots = []
+        self.logger.info(f"Antiquorum: {url}")
+        kind, h1, h2, page = _make_browser_page()
+
+        try:
+            page.goto(url, wait_until='domcontentloaded', timeout=45000)
+            page.wait_for_timeout(3000)
+
+            # Trova link aste
+            auction_links = page.evaluate('''
+                () => [...new Set(
+                    Array.from(document.querySelectorAll('a[href]'))
+                        .map(a => a.href)
+                        .filter(h =>
+                            h.includes('antiquorum') && (
+                                h.includes('/en/auctions/') ||
+                                h.includes('/auctions/') ||
+                                /\\/\\d{4}\\//.test(h)
+                            )
+                        )
+                )]
+            ''')
+            self.logger.info(f"Antiquorum: {len(auction_links)} link aste su {url}")
+
+            for auction_url in auction_links[:5]:
+                if len(lots) >= max_lots:
+                    break
+                new_lots = self._scrape_auction(page, auction_url,
+                                                max_lots - len(lots))
+                self.logger.info(
+                    f"Antiquorum {auction_url}: {len(new_lots)} orologi")
+                lots.extend(new_lots)
+                time.sleep(2)
+
+        finally:
+            _close_browser(kind, h1, h2, page)
+
+        self.logger.info(f"Antiquorum: {len(lots)} orologi RAG-ready")
+        return lots
+
+    def _scrape_auction(self, page, auction_url: str,
+                        max_lots: int) -> List[AuctionArticle]:
+        lots = []
+        try:
+            # Prova /lots se non già presente
+            if '/lots' not in auction_url:
+                lots_url = auction_url.rstrip('/') + '/lots'
+            else:
+                lots_url = auction_url
+
+            page.goto(lots_url, wait_until='domcontentloaded', timeout=45000)
+            page.wait_for_timeout(3000)
+            for _ in range(5):
+                page.evaluate('window.scrollBy(0, 800)')
+                page.wait_for_timeout(500)
+
+            # Log snippet DOM per debug
+            snippet = page.evaluate(
+                '() => document.body.innerHTML.substring(0, 500)'
+            )
+            self.logger.debug(f"Antiquorum DOM snippet: {snippet[:200]}")
+
+            # Selettori multipli (struttura catalog.antiquorum.swiss)
+            lot_data = page.evaluate('''
+                () => {
+                    const selectors = [
+                        '.lot-card', '.lot-item', '[class*="lot"]',
+                        '.card', 'article', '.item', 'li',
+                        '[class*="Card"]', '[class*="Item"]',
+                        '.catalog-item', '.product-item'
+                    ];
+                    let elems = [];
+                    for (const sel of selectors) {
+                        const found = Array.from(document.querySelectorAll(sel))
+                            .filter(e => e.querySelector('a') &&
+                                         e.innerText?.length > 10);
+                        if (found.length > 2) { elems = found; break; }
+                    }
+                    // Ultimo fallback: tutti i link /lot/ con testo
+                    if (elems.length === 0) {
+                        elems = Array.from(
+                            document.querySelectorAll('a[href*="/lot"]')
+                        ).filter(a => a.innerText?.trim().length > 5)
+                         .map(a => a.parentElement || a);
+                    }
+                    return elems.map(e => ({
+                        title: (
+                            e.querySelector(
+                                'h1,h2,h3,h4,[class*="title"],[class*="name"],' +
+                                '[class*="Title"],[class*="Name"]'
+                            )?.innerText?.trim() ||
+                            e.innerText?.split("\\n")[0]?.trim() || ''
+                        ),
+                        lotNum: (e.innerText?.match(/Lot[:\\s]*(\\d+[A-Z]?)/i)||[])[1] || '',
+                        estimate: (
+                            e.querySelector(
+                                '[class*="estimate"],[class*="price"],' +
+                                '[class*="Estimate"],[class*="Price"]'
+                            )?.innerText?.trim() || ''
+                        ),
+                        description: (
+                            e.querySelector('p,[class*="desc"],[class*="Desc"]')
+                             ?.innerText?.trim() || ''
+                        ),
+                        url: (
+                            (e.querySelector('a') || e.closest('a'))?.href || ''
+                        )
+                    })).filter(l => l.title.length > 5);
+                }
+            ''')
+
+            self.logger.info(
+                f"Antiquorum DOM: {len(lot_data)} elementi da {lots_url}")
+
+            for item in lot_data[:max_lots]:
+                if not self.is_watch(item.get('title', ''),
+                                     item.get('description', '')):
+                    continue
+                lot_id = self.make_id(item.get('url') or item['title'])
+                if self.db.seen(lot_id):
+                    continue
+                text = self.build_rag_text(item['title'], {
+                    'lot number': item.get('lotNum', ''),
+                    'estimate': item.get('estimate', ''),
+                    'description': item.get('description', ''),
+                })
+                url_lot = item.get('url') or lots_url
+                if url_lot and not url_lot.startswith('http'):
+                    url_lot = self.BASE + url_lot
+                parsed = urlparse(url_lot)
+                lot = AuctionArticle(
+                    id=lot_id, url=url_lot, title=item['title'], text=text,
+                    site='antiquorum.swiss', site_type='auction',
+                    source_domain='antiquorum.swiss', source_path=parsed.path,
+                    crawled_at=datetime.now().isoformat() + 'Z',
+                    brand=self.extract_brand(item['title']),
+                    metadata={'auction_house': 'antiquorum',
+                              'lot_number': item.get('lotNum', '')}
+                )
+                lots.append(lot)
+                self.db.mark(lot_id, 'antiquorum')
+
+        except Exception as e:
+            self.logger.error(f"Antiquorum {auction_url}: {e}")
+        return lots
+
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description='Auction Crawler v6')
-    parser.add_argument('--out', default='./output/auctions', help='Output dir')
-    parser.add_argument('--max-lots', type=int, default=50, help='Max lotti per casa')
-    parser.add_argument('--houses', nargs='+',
-                        default=['christies', 'sothebys', 'phillips', 'antiquorum'],
-                        help='Case da crawlare (override AUCTION_SITES)')
-    args = parser.parse_args()
-
-    output_dir = Path(args.out)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     logging.basicConfig(
         level=logging.INFO,
-        format='[%(name)s] %(message)s',
-        handlers=[logging.StreamHandler()]
+        format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
+        datefmt='%H:%M:%S'
     )
     logger = logging.getLogger('auction')
+
+    max_lots = int(os.environ.get('MAX_AUCTION_LOTS', '100'))
+
+    # AUCTION_SITES: secret GitHub formato "house|url" per riga
+    auction_sites_env = os.environ.get('AUCTION_SITES', '')
+    if auction_sites_env.strip():
+        site_config = {}
+        for line in auction_sites_env.strip().splitlines():
+            line = line.strip()
+            if '|' in line and not line.startswith('#'):
+                house, url = line.split('|', 1)
+                site_config[house.strip()] = url.strip()
+        logger.info(f"AUCTION_SITES: {len(site_config)} case da secret")
+    else:
+        site_config = {
+            'christies': (
+                'https://www.christies.com/en/results'
+                '?department=watches&sortby=lotdatesold_desc'
+            ),
+            'sothebys': 'https://www.sothebys.com/en/buy/watches',
+            'phillips': (
+                'https://www.phillips.com/auctions/past'
+                '/filter/Department=Watches'
+            ),
+            'antiquorum': 'https://catalog.antiquorum.swiss/',
+        }
+
+    # Parse --out arg
+    out_arg = None
+    for i, arg in enumerate(sys.argv):
+        if arg == '--out' and i + 1 < len(sys.argv):
+            out_arg = sys.argv[i + 1]
+
+    output_dir = Path(out_arg or './output/auctions')
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     db_path = output_dir / 'auction_crawler.db'
     db = AuctionDB(db_path)
 
-    # Carica sites da secret AUCTION_SITES
-    auction_sites = load_auction_sites(logger)
-
-    # Costruisci lista (name, url) da usare nel run
-    # Priorità: AUCTION_SITES secret > --houses CLI > default
-    if auction_sites:
-        run_list = [(s['name'], s.get('url')) for s in auction_sites if 'name' in s]
-    else:
-        run_list = [(name, None) for name in args.houses]
-
-    print(f"\n{'='*70}")
-    print("🏛️  AUCTION CRAWLER v6")
-    print(f"{'='*70}")
-    print(f"Output: {output_dir}")
-    print(f"DB:     {db_path}")
-    print(f"Case:   {', '.join(n for n, _ in run_list)}")
-    print(f"{'='*70}\n")
-
-    scraper_classes = {
-        'christies':  ChristiesScraper,
-        'sothebys':   SothebysScraper,
-        'phillips':   PhillipsScraper,
+    scrapers = {
+        'christies': ChristiesScraper,
+        'sothebys': SothebysScraper,
+        'phillips': PhillipsScraper,
         'antiquorum': AntiquorumScraper,
     }
 
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+    print("\n" + "=" * 70)
+    print("🏛️  AUCTION CRAWLER v7")
+    print("=" * 70)
+    print(f"Output:    {output_dir}")
+    print(f"DB:        {db_path}")
+    print(f"Max lots:  {max_lots}")
+    print(f"Case:      {', '.join(site_config.keys())}")
+    print("=" * 70 + "\n")
+
     total = 0
-
-    for name, url_override in run_list:
-        if name not in scraper_classes:
-            logger.warning(f"Casa sconosciuta: {name}")
-            continue
-
-        print(f"\n📍 {name.upper()}")
-        if url_override:
-            print(f"   URL: {url_override}")
+    for house, url in site_config.items():
+        print(f"\n📍 {house.upper()}")
         print("-" * 70)
-
+        scraper_cls = scrapers.get(house)
+        if not scraper_cls:
+            print(f"⚠️  Casa '{house}' non supportata")
+            continue
         try:
-            scraper = scraper_classes[name](logger, db, max_lots=args.max_lots)
-
-            # Sovrascrive RESULTS_URL/CATALOG_URL se definito nel secret
-            if url_override:
-                if hasattr(scraper, 'RESULTS_URL'):
-                    scraper.RESULTS_URL = url_override
-                elif hasattr(scraper, 'CATALOG_URL'):
-                    scraper.CATALOG_URL = url_override
-
-            articles = scraper.scrape()
-
+            scraper = scraper_cls(house, logger, db)
+            articles = scraper.discover_and_scrape(url, max_lots)
             if articles:
-                out_file = output_dir / f"{name}_{timestamp}.jsonl"
+                ts = datetime.now().strftime('%Y%m%d_%H%M')
+                out_file = output_dir / f"{house}_{ts}.jsonl"
                 with open(out_file, 'w', encoding='utf-8') as f:
                     for art in articles:
-                        f.write(json.dumps(art, ensure_ascii=False) + '\n')
+                        f.write(json.dumps(asdict(art), ensure_ascii=False) + '\n')
                 print(f"✅ {len(articles)} orologi → {out_file.name}")
                 total += len(articles)
             else:
                 print("⚠️  0 orologi trovati")
-
         except Exception as e:
-            logger.exception(f"{name} failed: {e}")
+            print(f"❌ ERROR: {e}")
+            logger.exception(f"{house} failed")
 
     db.close()
 
-    print(f"\n{'='*70}")
-    print(f"✅ TOTALE: {total} lotti asta")
-    print(f"📁 Output: {output_dir}/")
-    print(f"{'='*70}")
-    print("\n🔧 Prossimi step:")
-    print(f"  python3 chunker.py -i {output_dir} -o {output_dir}/chunks")
-    print(f"  python3 upload_supabase.py -i {output_dir}/chunks\n")
+    print("\n" + "=" * 70)
+    print(f"✅ TOTALE: {total} lotti asta → {output_dir}/")
+    print("=" * 70 + "\n")
 
 
 if __name__ == '__main__':

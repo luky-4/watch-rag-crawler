@@ -640,60 +640,18 @@ def discover_urls_robust(base_url: str, logger: logging.Logger, mode: str,
 
 
 def extract_brand(text: str) -> Optional[str]:
-    """Cerca il brand principale nel testo. Ordine: multi-word prima per evitare match parziali."""
     brands = [
-        # Multi-word prima (evita che 'Heuer' catturi 'TAG Heuer', ecc.)
-        'Patek Philippe', 'Audemars Piguet', 'Vacheron Constantin',
-        'TAG Heuer', 'Grand Seiko', 'Glashutte Original', 'Glashütte Original',
-        'Girard-Perregaux', 'Girard Perregaux',
-        'A. Lange & Söhne', 'A. Lange',
-        'Jaeger-LeCoultre', 'Jaeger LeCoultre',
-        'F.P. Journe', 'FP Journe',
-        'Richard Mille', 'Ulysse Nardin', 'Franck Muller',
-        'Bell & Ross', 'MB&F',
-        # Single-word
-        'Rolex', 'Omega', 'Breguet', 'Blancpain', 'Cartier',
-        'Panerai', 'Breitling', 'IWC', 'Tudor', 'Longines',
-        'Piaget', 'Parmigiani', 'Hublot', 'Zenith', 'Chopard',
-        'Seiko', 'Hamilton', 'Doxa', 'Urwerk', 'HYT',
+        'Rolex', 'Omega', 'Seiko', 'Breitling', 'Patek Philippe',
+        'Audemars Piguet', 'Vacheron Constantin', 'IWC', 'Panerai',
+        'Cartier', 'Tudor', 'Grand Seiko', 'Urwerk', 'Doxa',
+        'Hamilton', 'Marathon', 'Heuer', 'TAG Heuer', 'Longines', 'Blancpain'
     ]
+    
     text_lower = text.lower()
     for brand in brands:
         if brand.lower() in text_lower:
             return brand
     return None
-
-
-# Mappa dominio → brand canonico per siti brand ufficiali
-_DOMAIN_BRAND_MAP = {
-    'rolex.com':               'Rolex',
-    'patek.com':               'Patek Philippe',
-    'audemarspiguet.com':      'Audemars Piguet',
-    'tagheuer.com':            'TAG Heuer',
-    'tudorwatch.com':          'Tudor',
-    'breguet.com':             'Breguet',
-    'blancpain.com':           'Blancpain',
-    'glashuette-original.com': 'Glashutte Original',
-    'cartier.com':             'Cartier',
-    'girard-perregaux.com':    'Girard-Perregaux',
-    'parmigiani.com':          'Parmigiani',
-    'piaget.com':              'Piaget',
-    'omegawatches.com':        'Omega',
-    'iwc.com':                 'IWC',
-    'panerai.com':             'Panerai',
-    'breitling.com':           'Breitling',
-    'longines.com':            'Longines',
-    'vacheron-constantin.com': 'Vacheron Constantin',
-    'jaeger-lecoultre.com':    'Jaeger-LeCoultre',
-    'richardmille.com':        'Richard Mille',
-    'hublot.com':              'Hublot',
-    'zenith-watches.com':      'Zenith',
-    'chopard.com':             'Chopard',
-    'alange-soehne.com':       'A. Lange & Söhne',
-    'ulyssenardin.com':        'Ulysse Nardin',
-    'fpjourne.com':            'F.P. Journe',
-    'mbandf.com':              'MB&F',
-}
 
 
 def extract_article(url: str, logger: logging.Logger) -> Optional[Dict]:
@@ -738,19 +696,58 @@ def extract_article(url: str, logger: logging.Logger) -> Optional[Dict]:
         return None
 
 
+def extract_article_camoufox(url: str, logger: logging.Logger) -> Optional[Dict]:
+    """Estrae contenuto con Camoufox (Firefox stealth) — per siti con antibot aggressivo."""
+    try:
+        from camoufox.sync_api import Camoufox
+        with Camoufox(headless=False, virtual_display=True) as browser:
+            page = browser.new_page()
+            page.goto(url, wait_until='domcontentloaded', timeout=45000)
+            page.wait_for_timeout(3000)
+            try:
+                page.evaluate('window.scrollTo(0, document.body.scrollHeight / 2)')
+                page.wait_for_timeout(1500)
+            except:
+                pass
+            title = page.title()
+            text = page.evaluate('''
+                () => {
+                    const unwanted = document.querySelectorAll('script, style, nav, footer, header, .cookie, .modal');
+                    unwanted.forEach(el => el.remove());
+                    return document.body.innerText || '';
+                }
+            ''')
+            text = '\n'.join(line.strip() for line in text.split('\n') if line.strip())
+            if not text or len(text) < 100:
+                return None
+            return {'source_url': url, 'title': title, 'text': text, 'date': None, 'authors': None}
+    except Exception as e:
+        logger.debug(f"Camoufox extract error {url}: {e}")
+        return None
+
+
 def extract_article_playwright(url: str, logger: logging.Logger) -> Optional[Dict]:
-    """Estrae contenuto con Playwright per pagine heavy-JS (Rolex, Tudor, Glashutte, ecc.)"""
+    """Estrae contenuto con Playwright headless per pagine heavy-JS (Rolex, ecc.)
+    
+    IMPORTANTE: headless=True obbligatorio su GitHub Actions (no display X11).
+    Camoufox (Firefox stealth) viene provato prima come strategia antibot migliore.
+    """
     if not PLAYWRIGHT_AVAILABLE:
         return None
     
+    # Prova prima Camoufox (Firefox stealth, migliore contro antibot)
+    result = extract_article_camoufox(url, logger)
+    if result:
+        return result
+    
+    # Fallback: Playwright Chromium headless (headless=True obbligatorio su CI)
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
-                headless=True,  # MUST be True in CI/GitHub Actions (no display)
+                headless=True,  # CRITICO: False crasha su GitHub Actions (no X11)
                 args=[
                     '--disable-blink-features=AutomationControlled',
                     '--no-sandbox',
-                    '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
                     '--disable-gpu',
                 ]
@@ -759,9 +756,10 @@ def extract_article_playwright(url: str, logger: logging.Logger) -> Optional[Dic
                 user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 viewport={'width': 1920, 'height': 1080},
                 locale='en-US',
-                timezone_id='America/New_York',
+                timezone_id='Europe/London',
             )
             context.set_extra_http_headers({
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.9',
                 'DNT': '1',
             })
@@ -769,66 +767,23 @@ def extract_article_playwright(url: str, logger: logging.Logger) -> Optional[Dic
             page = context.new_page()
             page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
             
-            # domcontentloaded è più veloce e affidabile di networkidle per brand JS-heavy
-            page.goto(url, wait_until='domcontentloaded', timeout=25000)
-            page.wait_for_timeout(2500)
+            page.goto(url, wait_until='domcontentloaded', timeout=45000)
+            page.wait_for_timeout(4000)
             
-            # Scroll per triggerare lazy content
             try:
                 page.evaluate('window.scrollTo(0, document.body.scrollHeight / 2)')
-                page.wait_for_timeout(800)
+                page.wait_for_timeout(1500)
             except:
                 pass
             
             title = page.title()
-
-            # Estrai metadati da meta tags (date e author)
-            meta = page.evaluate('''() => {
-                const get = (sel) => {
-                    const el = document.querySelector(sel);
-                    return el ? (el.getAttribute("content") || el.getAttribute("datetime") || el.textContent || "").trim() : null;
-                };
-                return {
-                    date: get('meta[property="article:published_time"]')
-                       || get('meta[name="date"]')
-                       || get('meta[name="publish_date"]')
-                       || get('meta[name="DC.date"]')
-                       || get('meta[itemprop="datePublished"]')
-                       || get('time[itemprop="datePublished"]')
-                       || get('time[datetime]')
-                       || null,
-                    author: get('meta[name="author"]')
-                          || get('meta[property="article:author"]')
-                          || get('[itemprop="author"] [itemprop="name"]')
-                          || get('[rel="author"]')
-                          || null,
-                    description: get('meta[name="description"]')
-                               || get('meta[property="og:description"]')
-                               || null,
-                };
-            }''')
-
-            # Prova prima selettori semantici di contenuto, poi fallback su body
-            text = page.evaluate('''() => {
-                const unwanted = document.querySelectorAll(
-                    "script, style, nav, footer, header, " +
-                    "[class*='cookie'], [class*='modal'], [class*='popup'], " +
-                    "[class*='banner'], [id*='cookie'], [id*='modal'], " +
-                    "[class*='newsletter'], [class*='social'], [class*='share'], " +
-                    "[class*='related'], [class*='sidebar'], [class*='menu']"
-                );
-                unwanted.forEach(el => el.remove());
-                // Prova selettori semantici comuni sui siti brand luxury
-                const main = document.querySelector(
-                    "article, [role='main'], main, " +
-                    "[class*='article__body'], [class*='article-body'], " +
-                    "[class*='content-body'], [class*='post-content'], " +
-                    "[class*='entry-content'], [class*='page-content'], " +
-                    "[class*='product-description'], [class*='watch-description'], " +
-                    "[class*='editorial'], [class*='story'], [class*='news-detail']"
-                );
-                return (main || document.body).innerText || "";
-            }''')
+            text = page.evaluate('''
+                () => {
+                    const unwanted = document.querySelectorAll('script, style, nav, footer, header, .cookie, .modal');
+                    unwanted.forEach(el => el.remove());
+                    return document.body.innerText || '';
+                }
+            ''')
             
             browser.close()
             
@@ -836,19 +791,13 @@ def extract_article_playwright(url: str, logger: logging.Logger) -> Optional[Dic
             
             if not text or len(text) < 100:
                 return None
-
-            # Normalizza data: tronca a YYYY-MM-DD se è ISO timestamp completo
-            date_val = meta.get('date') if meta else None
-            if date_val and len(date_val) >= 10:
-                date_val = date_val[:10]
             
             return {
-                'source_url':  url,
-                'title':       title,
-                'text':        text,
-                'date':        date_val,
-                'authors':     meta.get('author') if meta else None,
-                'description': meta.get('description') if meta else None,
+                'source_url': url,
+                'title': title,
+                'text': text,
+                'date': None,
+                'authors': None
             }
             
     except Exception as e:
@@ -958,35 +907,56 @@ def process_site(
                 logger.error(f"Discovery error: {e}")
                 urls = list(_partial) if _partial else []
 
-        # Per siti brand: filtra solo categorie non rilevanti e pagine funzionali
+        # Per siti brand: filtra URL non-inglesi e categorie non rilevanti
         if mode == 'brand':
+            _LANG_PREFIXES = (
+                '/fr/', '/de/', '/it/', '/es/', '/ja/', '/zh/', '/ko/', '/ru/',
+                '/pt/', '/nl/', '/pl/', '/tr/', '/ar/', '/cs/', '/hu/', '/ro/',
+                '/da/', '/sv/', '/fi/', '/nb/', '/he/', '/th/', '/vi/',
+            )
             _JUNK_SEGMENTS = (
-                # Negozi e distribuzione
+                # Retail / stores
                 '/boutiques/', '/points-of-sale/', '/points-de-vente/',
                 '/dealers/', '/stores/', '/retailers/', '/stockists/',
-                '/retailers/', '/find-a-retailer/', '/store-locator/',
-                '/points-de-vente/', '/revendeurs/', '/rivenditori/',
-                # Non-watch product categories
-                '/bags-and-accessories/', '/our-sunglasses/', '/sunglasses/',
-                '/jewellery/', '/jewelry/', '/joaillerie/', '/fine-jewellery/',
-                '/perfumes/', '/fragrances/', '/parfums/',
-                '/lighters/', '/accessories/', '/eyewear/',
-                '/ready-to-wear/', '/fashion/', '/lifestyle/',
-                # Pagine funzionali utente
+                '/find-a-retailer/', '/store-locator/', '/revendeurs/', '/rivenditori/',
+                # Non-watch products
+                '/bags-and-accessories/', '/sunglasses/', '/our-sunglasses/',
+                '/jewellery/', '/jewelry/', '/fine-jewellery/',
+                '/perfumes/', '/fragrances/', '/lighters/',
+                '/accessories/', '/eyewear/', '/ready-to-wear/',
+                '/fashion/', '/lifestyle/',
+                # Account / transactional
                 '/my-', '/myomega/', '/my-favourites/', '/wishlist/',
-                '/cart/', '/checkout/', '/account/', '/login/', '/register/',
-                '/service/enquiry', '/enquiry', '/contact/',
-                # Pagine legali/istituzionali
+                '/cart/', '/checkout/', '/account/', '/login/',
+                '/register/', '/contact/',
+                # Servizi non-RAG
+                '/service/enquiry', '/enquiry',
+                '/service/repairs', '/service/warranty',
+                '/smartwatches/',
+                # Pagine API / frammenti JS (Cartier, ecc.)
+                '/fragments/', '/fragment/',
+                # Configuratori interattivi (Tudor, ecc.)
+                '/configurator',
+                # Legal / policy
                 '/legal/', '/mentions-legales/', '/conditions-generales/',
                 '/privacy/', '/cookie/', '/terms/', '/impressum/',
                 '/aviso-legal/', '/note-legali/', '/datenschutz/',
-                '/sitemap', '/robots', '/search?', '/recherche?',
-                # Tracking/junk query params
+                # Sitemap / search
+                '/sitemap', '/robots',
+                # Query params tracciamento
                 'fbclid=', 'utm_', 'gclid=',
             )
+            filtered = []
+            for u in urls:
+                parsed_path = '/' + '/'.join(u.split('?')[0].split('/')[3:])
+                if any(parsed_path.startswith(lp) for lp in _LANG_PREFIXES):
+                    continue
+                if any(seg in u for seg in _JUNK_SEGMENTS):
+                    continue
+                filtered.append(u)
             before = len(urls)
-            urls = [u for u in urls if not any(seg in u for seg in _JUNK_SEGMENTS)]
-            logger.info(f"Brand URL filter: {before} -> {len(urls)} (rimossi {before - len(urls)} junk/non-watch)")
+            urls = filtered
+            logger.info(f"Brand URL filter: {before} -> {len(urls)} (rimossi {before - len(urls)} non-EN/junk)")
 
         # Fix: confronta URL normalizzati (rimuovi trailing slash e frammenti)
         crawled_urls_normalized = {url.rstrip('/').split('#')[0] for url in crawled_urls}
@@ -1037,11 +1007,7 @@ def process_site(
                     art['source_domain'] = domain
                     art['source_path'] = parsed_url.path
                     art['crawled_at'] = datetime.utcnow().isoformat() + 'Z'
-                    # Siti brand: domain map (certo). Blog: text scan.
-                    _domain_brand = next(
-                        (b for k, b in _DOMAIN_BRAND_MAP.items() if k in domain), None
-                    )
-                    art['brand'] = _domain_brand or extract_brand(art['text'][:1000])
+                    art['brand'] = extract_brand(art['text'][:1000])
                     
                     with lock:
                         with open(articles_file, 'a', encoding='utf-8') as f:
