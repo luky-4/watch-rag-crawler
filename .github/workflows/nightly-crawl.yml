@@ -63,7 +63,7 @@ jobs:
           # Reset COMPLETO timezone.com: cancella tutte le righe (non solo quelle vuote)
           # così il crawler le ri-scarica tutte al prossimo run
           if [ -f output/crawler.db ]; then
-            DELETED=$(sqlite3 output/crawler.db "DELETE FROM crawled_urls WHERE url LIKE '%timezone.com%'; SELECT changes();")
+            DELETED=$(sqlite3 output/crawler.db "DELETE FROM urls WHERE url LIKE '%timezone.com%'; SELECT changes();")
             echo "🗑️ Timezone.com reset: $DELETED righe cancellate dal crawler DB"
           fi
       
