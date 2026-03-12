@@ -59,6 +59,13 @@ jobs:
           else
             echo "⚠️ No previous chunker DB - starting fresh"
           fi
+
+          # Reset COMPLETO timezone.com: cancella tutte le righe (non solo quelle vuote)
+          # così il crawler le ri-scarica tutte al prossimo run
+          if [ -f output/crawler.db ]; then
+            DELETED=$(sqlite3 output/crawler.db "DELETE FROM crawled_urls WHERE url LIKE '%timezone.com%'; SELECT changes();")
+            echo "🗑️ Timezone.com reset: $DELETED righe cancellate dal crawler DB"
+          fi
       
       - name: 🐍 Setup Python 3.11
         uses: actions/setup-python@v5
@@ -66,19 +73,14 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
       
-      - name: 📦 Install system deps (Xvfb per Camoufox virtual_display)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y xvfb
-
       - name: 📦 Install dependencies
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-          pip install requests
-          # Camoufox: Firefox anti-detect con virtual_display.
-          # virtual_display=True avvia Xvfb internamente → risolve "Missing X server"
-          # su GitHub Actions ed è più stealth di headless puro (fingerprint reale).
+          # Xvfb: display virtuale richiesto da Camoufox virtual_display=True su GitHub Actions
+          sudo apt-get install -y xvfb
+          # Camoufox: Firefox anti-detect, bypassa meglio gli antibot di Chromium.
+          # Fallback automatico a Playwright se qualcosa va storto.
           pip install camoufox
           python -m camoufox fetch
           # Playwright come fallback
@@ -99,17 +101,6 @@ jobs:
           echo "$BRAND_SEEDS" > config/brand_seeds.json
           echo "✅ Created brand_seeds.json"
       
-      - name: 🧹 Reset timezone.com (URL crawlati senza contenuto)
-        run: |
-          if [ -f output/crawler.db ]; then
-            DELETED=$(sqlite3 output/crawler.db \
-              "DELETE FROM crawled_urls WHERE domain LIKE '%timezone%' AND (content IS NULL OR content = '' OR length(content) < 100); SELECT changes();")
-            echo "✅ timezone.com reset: $DELETED URL rimossi dal DB → verranno ri-crawlati"
-          else
-            echo "⚠️ crawler.db non trovato, skip reset"
-          fi
-        continue-on-error: true
-
       - name: 🕷️ Run crawler
         run: |
           MAX_PAGES=${{ github.event.inputs.max_pages || '0' }}
@@ -121,35 +112,7 @@ jobs:
             --workers 4
         continue-on-error: true
       
-      - name: 🏛️ Download auction DB from Supabase
-        continue-on-error: true
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-        run: |
-          HTTP=$(curl -s -o auction_crawler.db.gz -w "%{http_code}" \
-            "$SUPABASE_URL/storage/v1/object/crawler-dbs/auction_crawler.db.gz" \
-            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY")
-          if [ "$HTTP" = "200" ]; then
-            mkdir -p output/auctions
-            gunzip -c auction_crawler.db.gz > output/auctions/auction_crawler.db
-            echo "✅ auction_crawler.db scaricato ($(ls -lh output/auctions/auction_crawler.db | awk '{print $5}'))"
-          else
-            echo "⚠️ auction_crawler.db non trovato (HTTP $HTTP) - fresh start"
-            rm -f auction_crawler.db.gz
-          fi
-
-      - name: 🏛️ Run auction crawler
-        if: success() || failure()
-        env:
-          MAX_AUCTION_LOTS: ${{ vars.MAX_AUCTION_LOTS || '100' }}
-          AUCTION_SITES: ${{ secrets.AUCTION_SITES }}
-        run: |
-          python3 crawlers/auction_crawler.py \
-            --out ./output/auctions
-        continue-on-error: true
-      
-      - name: 🔨 Run chunker (articoli siti)
+      - name: 🔨 Run chunker
         if: success() || failure()
         run: |
           python3 processing/chunker.py \
@@ -158,17 +121,38 @@ jobs:
             --chunk-size 300
         continue-on-error: true
 
-      - name: 🔨 Run chunker (lotti asta)
+      - name: 🏛️ Run auction crawler
+        if: success() || failure()
+        env:
+          MAX_AUCTION_LOTS: ${{ vars.MAX_AUCTION_LOTS || '200' }}
+          AUCTION_SITES: ${{ secrets.AUCTION_SITES }}
+        run: |
+          mkdir -p output/auctions
+          # Scarica DB aste precedente se esiste
+          HTTP=$(curl -s -o output/auctions/auction_crawler.db.gz -w "%{http_code}" \
+            "${{ secrets.SUPABASE_URL }}/storage/v1/object/crawler-dbs/auction_crawler.db.gz" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_KEY }}")
+          if [ "$HTTP" = "200" ]; then
+            gunzip -f output/auctions/auction_crawler.db.gz
+            echo "✅ auction_crawler.db scaricato"
+          else
+            echo "⚠️ auction_crawler.db non trovato (HTTP $HTTP) - fresh start"
+          fi
+          python3 crawlers/auction_crawler.py --out ./output/auctions
+        continue-on-error: true
+
+      - name: 🔨 Run chunker auction
         if: success() || failure()
         run: |
-          if [ -d output/auctions ] && [ "$(ls output/auctions/*.jsonl 2>/dev/null | wc -l)" -gt 0 ]; then
+          JSONL_COUNT=$(find output/auctions -name "*.jsonl" 2>/dev/null | wc -l)
+          if [ "$JSONL_COUNT" -gt 0 ]; then
+            echo "✅ Trovati $JSONL_COUNT file JSONL aste → chunking"
             python3 processing/chunker.py \
               -i ./output/auctions \
               -o ./output/chunks \
               --chunk-size 300
-            echo "✅ Auction chunks generati"
           else
-            echo "⚠️ Nessun file auction JSONL trovato, skip chunker auction"
+            echo "⚠️ Nessun file JSONL aste trovato, skip chunker"
           fi
         continue-on-error: true
       
@@ -217,17 +201,17 @@ jobs:
             [ "$HTTP" = "200" ] && echo "✅ chunker.db.gz uploadato su Supabase" || echo "❌ Upload chunker fallito (HTTP $HTTP)"
           fi
 
-          # Comprimi e upload auction DB
+          # Comprimi auction DB
           if [ -f output/auctions/auction_crawler.db ]; then
-            gzip -c output/auctions/auction_crawler.db > auction_crawler.db.gz
-            echo "✅ Auction DB compressed: $(ls -lh auction_crawler.db.gz | awk '{print $5}')"
+            gzip -f output/auctions/auction_crawler.db
+            echo "✅ Auction DB compressed: $(ls -lh output/auctions/auction_crawler.db.gz | awk '{print $5}')"
             HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
               "$SUPABASE_URL/storage/v1/object/crawler-dbs/auction_crawler.db.gz" \
               -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
               -H "Content-Type: application/octet-stream" \
               -H "x-upsert: true" \
-              --data-binary @auction_crawler.db.gz)
-            [ "$HTTP" = "200" ] && echo "✅ auction_crawler.db.gz uploadato su Supabase" || echo "❌ Upload auction fallito (HTTP $HTTP)"
+              --data-binary @output/auctions/auction_crawler.db.gz)
+            [ "$HTTP" = "200" ] && echo "✅ auction_crawler.db.gz uploadato su Supabase" || echo "❌ Upload auction DB fallito (HTTP $HTTP)"
           fi
 
       - name: 📊 Generate summary
