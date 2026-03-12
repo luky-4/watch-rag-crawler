@@ -700,7 +700,10 @@ def extract_article_camoufox(url: str, logger: logging.Logger) -> Optional[Dict]
     """Estrae contenuto con Camoufox (Firefox stealth) — per siti con antibot aggressivo."""
     try:
         from camoufox.sync_api import Camoufox
-        with Camoufox(headless=False, virtual_display=True) as browser:
+        # virtual_display=True richiesto su GitHub Actions (no X server)
+        # In locale lasciare False per massima stealth (Firefox reale visibile)
+        _vd = os.environ.get('CAMOUFOX_VIRTUAL_DISPLAY', '').lower() in ('1', 'true', 'yes')
+        with Camoufox(headless=False, virtual_display=_vd) as browser:
             page = browser.new_page()
             page.goto(url, wait_until='domcontentloaded', timeout=45000)
             page.wait_for_timeout(3000)
