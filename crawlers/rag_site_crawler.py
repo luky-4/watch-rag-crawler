@@ -719,10 +719,15 @@ def extract_article_camoufox(url: str, logger: logging.Logger) -> Optional[Dict]
             ''')
             text = '\n'.join(line.strip() for line in text.split('\n') if line.strip())
             if not text or len(text) < 100:
+                logger.debug(f"Camoufox: contenuto vuoto/troppo corto ({len(text)} chars) per {url} → antibot attivo?")
                 return None
+            logger.debug(f"Camoufox: ✅ estratti {len(text)} chars da {url}")
             return {'source_url': url, 'title': title, 'text': text, 'date': None, 'authors': None}
+    except ImportError:
+        logger.debug(f"Camoufox non disponibile → fallback Playwright")
+        return None
     except Exception as e:
-        logger.debug(f"Camoufox extract error {url}: {e}")
+        logger.debug(f"Camoufox exception {url}: {type(e).__name__}: {str(e)[:120]}")
         return None
 
 
@@ -913,6 +918,16 @@ def process_site(
                 '/fr/', '/de/', '/it/', '/es/', '/ja/', '/zh/', '/ko/', '/ru/',
                 '/pt/', '/nl/', '/pl/', '/tr/', '/ar/', '/cs/', '/hu/', '/ro/',
                 '/da/', '/sv/', '/fi/', '/nb/', '/he/', '/th/', '/vi/',
+                # Country/lang annidati (es. Tag Heuer: /ch/hans/, /jp/ja/, /au/hans/)
+                # Pattern: /<country-2char>/<lang>/ dove lang è non-EN
+                '/hans/', '/hant/',                     # cinese semplificato/tradizionale
+                '/ja-', '/ko-', '/zh-', '/ru-',         # lang dash variants
+            )
+            # Pattern più robusto per URL tipo /ch/hans/... /jp/ja/... /au/hans/...
+            _COUNTRY_LANG_RE = re.compile(
+                r'^/[a-z]{2}/(fr|de|it|es|ja|zh|ko|ru|pt|nl|pl|tr|ar|cs|hu|ro'
+                r'|da|sv|fi|nb|he|th|vi|hans|hant)(/|$)',
+                re.IGNORECASE
             )
             _JUNK_SEGMENTS = (
                 # Retail / stores
@@ -950,6 +965,8 @@ def process_site(
             for u in urls:
                 parsed_path = '/' + '/'.join(u.split('?')[0].split('/')[3:])
                 if any(parsed_path.startswith(lp) for lp in _LANG_PREFIXES):
+                    continue
+                if _COUNTRY_LANG_RE.match(parsed_path):
                     continue
                 if any(seg in u for seg in _JUNK_SEGMENTS):
                     continue
