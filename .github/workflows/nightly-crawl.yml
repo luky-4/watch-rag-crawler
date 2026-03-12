@@ -102,6 +102,8 @@ jobs:
           echo "✅ Created brand_seeds.json"
       
       - name: 🕷️ Run crawler
+        env:
+          CAMOUFOX_VIRTUAL_DISPLAY: "1"
         run: |
           MAX_PAGES=${{ github.event.inputs.max_pages || '0' }}
           
